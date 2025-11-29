@@ -96,6 +96,8 @@ void initialize_working_thread(){
   non_transactional_table=g_new(struct MList, 1);
   transactional_table->list=NULL;
   non_transactional_table->list=NULL;
+  transactional_table->count=0;
+  non_transactional_table->count=0;
   non_transactional_table->mutex = g_mutex_new();
   transactional_table->mutex = g_mutex_new();
 
@@ -145,10 +147,19 @@ void start_working_thread(struct configuration *conf ){
     thread_data[n].binlog_snapshot_gtid_executed = NULL;
     thread_data[n].pause_resume_mutex=NULL;
     thread_data[n].table_name=NULL;
-    thread_data[n].thread_data_buffers.statement = g_string_sized_new(2*statement_size);
-    thread_data[n].thread_data_buffers.row = g_string_sized_new(statement_size);
-    thread_data[n].thread_data_buffers.column = g_string_sized_new(statement_size);
-    thread_data[n].thread_data_buffers.escaped = g_string_sized_new(statement_size);
+    // OPTIMIZATION: Pre-allocate larger buffers to reduce reallocation overhead
+    // Statement buffer: 4x statement_size for batch operations with large rows
+    // Row buffer: 2x for tables with many columns
+    // Column buffer: 64KB initial for large TEXT/BLOB fields
+    // Escaped buffer: 128KB for worst-case escape expansion (2x column size)
+    // These sizes significantly reduce g_string_maybe_expand() calls during dump
+    thread_data[n].thread_data_buffers.statement = g_string_sized_new(4*statement_size);
+    thread_data[n].thread_data_buffers.row = g_string_sized_new(2*statement_size);
+    thread_data[n].thread_data_buffers.column = g_string_sized_new(65536);  // 64KB
+    thread_data[n].thread_data_buffers.escaped = g_string_sized_new(131072);  // 128KB
+    // OPTIMIZATION: Initialize thread-local row counter for batched updates
+    thread_data[n].local_row_count = 0;
+    thread_data[n].local_row_count_dbt = NULL;
     threads[n] =
         m_thread_new("data", (GThreadFunc)working_thread, &thread_data[n], "Data thread could not be created");
   }
@@ -336,15 +347,24 @@ union chunk_step *new_partition_step(gchar *partition){
 }
 
 void m_async_queue_push_conservative(GAsyncQueue *queue, struct job *element){
+  // OPTIMIZATION: Use adaptive backpressure instead of hard sleep(5)
   // Each job weights 500 bytes aprox.
-  // if we reach to 200k of jobs, which is 100MB of RAM, we are going to wait 5 seconds
-  // which is not too much considering that it will impossible to proccess 200k of jobs
-  // in 5 seconds.
-  // I don't think that we need to this values as parameters, unless that a user needs to
-  // set hundreds of threads
-  while (g_async_queue_length(queue)>200000){
-    g_warning("Too many jobs in the queue. We are pausing the jobs creation for 5 seconds.");
-    sleep(5);
+  // Reduced threshold from 200K to 50K jobs (25MB RAM) for faster response
+  // Use shorter sleeps with exponential backoff instead of blocking 5 seconds
+  gint queue_len = g_async_queue_length(queue);
+  if (queue_len > 50000) {
+    // Log only first time we hit the threshold per backoff cycle
+    static gint64 last_warning_time = 0;
+    gint64 now = g_get_monotonic_time();
+    if (now - last_warning_time > 5000000) {  // Log at most every 5 seconds
+      g_warning("Queue backpressure: %d jobs queued, throttling job creation", queue_len);
+      last_warning_time = now;
+    }
+    // Adaptive sleep: 10ms base, scaling up with queue size
+    // At 50K: 10ms, at 100K: 20ms, at 200K: 40ms (capped)
+    guint sleep_ms = 10 * (queue_len / 50000);
+    if (sleep_ms > 100) sleep_ms = 100;  // Cap at 100ms
+    g_usleep(sleep_ms * 1000);
   }
   g_async_queue_push(queue, element);
 }
@@ -886,12 +906,14 @@ void new_table_to_dump(MYSQL *conn, struct configuration *conf, gboolean is_view
           dbt->is_transactional=TRUE;
           g_mutex_lock(transactional_table->mutex);
           transactional_table->list=g_list_prepend(transactional_table->list,dbt);
+          transactional_table->count++;
           g_mutex_unlock(transactional_table->mutex);
 
         } else {
           dbt->is_transactional=FALSE;
           g_mutex_lock(non_transactional_table->mutex);
           non_transactional_table->list = g_list_prepend(non_transactional_table->list, dbt);
+          non_transactional_table->count++;
           g_mutex_unlock(non_transactional_table->mutex);
         }
       }else{
@@ -899,6 +921,7 @@ void new_table_to_dump(MYSQL *conn, struct configuration *conf, gboolean is_view
           dbt->is_transactional=FALSE;
           g_mutex_lock(non_transactional_table->mutex);
           non_transactional_table->list = g_list_prepend(non_transactional_table->list, dbt);
+          non_transactional_table->count++;
           g_mutex_unlock(non_transactional_table->mutex);
         }
       }
@@ -1067,13 +1090,16 @@ void dump_database_thread(MYSQL *conn, struct database *database) {
     /* Check if the table was recently updated */
     if (no_updated_tables && !is_view && !is_sequence) {
       GList *iter;
+      // OPTIMIZATION: Allocate string once outside loop, free after (was memory leak)
+      gchar *full_table_name = g_strdup_printf("%s.%s", database->source_database, row[0]);
       for (iter = no_updated_tables; iter != NULL; iter = iter->next) {
-        if (g_ascii_strcasecmp(
-                iter->data, g_strdup_printf("%s.%s", database->source_database, row[0])) == 0) {
+        if (g_ascii_strcasecmp(iter->data, full_table_name) == 0) {
           g_message("NO UPDATED TABLE: %s.%s", database->source_database, row[0]);
           dump = 0;
+          break;  // OPTIMIZATION: Stop searching after match found
         }
       }
+      g_free(full_table_name);
     }
 
     if (!dump)

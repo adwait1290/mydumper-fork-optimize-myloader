@@ -25,6 +25,7 @@
 #include "myloader_worker_index.h"
 #include "myloader_database.h"
 #include "myloader_worker_loader_main.h"
+#include "myloader_table.h"  // For table_lock/unlock and schema_cond
 
 GThread **threads = NULL;
 struct thread_data *loader_td = NULL;
@@ -55,6 +56,11 @@ struct data_job * new_data_job(enum data_job_type type, struct restore_job *rj){
 }
 
 void data_job_push(enum data_job_type type, struct restore_job *rj){
+  // Safety check: queue may not exist in --no-data mode
+  if (data_job_queue == NULL) {
+    trace("data_job_queue is NULL (--no-data mode), skipping push of %s", data_job_type2str(type));
+    return;
+  }
   trace("data_job_queue <- %s", data_job_type2str(type));
   g_async_queue_push(data_job_queue, new_data_job(type, rj) );
 }
@@ -66,23 +72,54 @@ void data_ended(){
 gboolean process_loader(struct thread_data * td) {
   struct db_table * dbt = NULL;
   struct data_job *dj= (struct data_job *)g_async_queue_pop(data_job_queue);
-  trace("data_job_queue -> %s", data_job_type2str(dj->type)); // dj->restore_job->dbt->database->target_database, dj->restore_job->dbt->source_table_name, dj->restore_job->dbt->current_threads);
+  g_debug("[LOADER] Thread %d: Received data job type=%s", td->thread_id, data_job_type2str(dj->type));
 
   switch (dj->type){
     case DATA_JOB:
       dbt=dj->restore_job->dbt;
       td->dbt=dj->restore_job->dbt;
+
+      // SCHEMA-WAIT: Block until table schema is created
+      // This is the definitive fix for the race condition between schema and data workers
+      table_lock(dbt);
+      while (dbt->schema_state < CREATED) {
+        // OPTIMIZATION: Only log when actually waiting (rare case)
+        g_debug("[LOADER] Thread %d: WAITING for schema creation of %s.%s (state=%s)",
+                  td->thread_id, dbt->database->target_database, dbt->source_table_name,
+                  status2str(dbt->schema_state));
+        // Wait on condition variable - releases mutex and blocks efficiently
+        g_cond_wait(dbt->schema_cond, dbt->mutex);
+      }
+      enum schema_status current_state = dbt->schema_state;
+      table_unlock(dbt);
+
+      // OPTIMIZATION: Only log schema ready at debug level to reduce I/O
+      g_debug("[LOADER] Thread %d: Schema READY for %s.%s (state=%s) file=%s",
+                td->thread_id, dbt->database->target_database, dbt->source_table_name,
+                status2str(current_state), dj->restore_job->filename);
+
+      // NOTE: We removed the separate visibility check here because:
+      // 1. It used a different connection from the pool than the one used for INSERT
+      // 2. The READ COMMITTED isolation level set in myloader.c should ensure visibility
+      // 3. The retry mechanism in restore_data_in_gstring_by_statement handles ERROR 1146
       process_restore_job(td, dj->restore_job);
       table_lock(dbt);
       dbt->current_threads--;
-      trace("%s.%s: done job, threads %u", dbt->database->target_database, dbt->source_table_name, dbt->current_threads);
+      g_debug("[LOADER] Thread %d: Completed job for %s.%s, threads now %u, remaining_jobs=%d",
+              td->thread_id, dbt->database->target_database, dbt->source_table_name,
+              dbt->current_threads, dbt->remaining_jobs);
+      // OPTIMIZATION: Re-enqueue table to ready queue if it still has jobs
+      // This enables O(1) dispatch for the next job on this table
+      enqueue_table_if_ready_locked(td->conf, dbt);
       table_unlock(dbt);
       break;
     case DATA_PROCESS_ENDED:
+      trace("L-Thread %d: DATA_PROCESS_ENDED, propagating", td->thread_id);
       data_job_push(DATA_PROCESS_ENDED, NULL);
       return FALSE;
       break;
     case DATA_ENDED:
+      trace("L-Thread %d: DATA_ENDED", td->thread_id);
       return FALSE;
       break;
     }
@@ -110,6 +147,11 @@ void *loader_thread(struct thread_data *td) {
 
 
 void wait_loader_threads_to_finish(){
+  // OPTIMIZATION: Skip if loader threads were never initialized (--no-data mode)
+  if (threads == NULL) {
+    g_debug("[LOADER] No loader threads to wait for (--no-data mode)");
+    return;
+  }
   guint n=0;
   for (n = 0; n < num_threads; n++) {
     g_thread_join(threads[n]);
@@ -146,8 +188,11 @@ void inform_restore_job_running(){
 
 
 void free_loader_threads(){
-  g_free(loader_td);
-  g_free(threads);
+  // OPTIMIZATION: Skip if loader threads were never initialized (--no-data mode)
+  if (loader_td != NULL)
+    g_free(loader_td);
+  if (threads != NULL)
+    g_free(threads);
 }
 
 

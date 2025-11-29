@@ -61,6 +61,8 @@ gboolean process_index(struct thread_data * td){
   dbt->finish_time=g_date_time_new_now_local();
   table_lock(dbt);
   dbt->schema_state=ALL_DONE;
+  // OPTIMIZATION: Increment atomic counter for O(1) progress tracking
+  g_atomic_int_inc(&(td->conf->tables_all_done));
   table_unlock(dbt);
   return TRUE;
 }
@@ -128,6 +130,8 @@ void enqueue_index_for_dbt_if_possible(struct configuration *conf, struct db_tab
     if (dbt->indexes == NULL){
       trace("Table %s %s is all done", dbt->database->target_database, dbt->table_filename);
       dbt->schema_state=ALL_DONE;
+      // OPTIMIZATION: Increment atomic counter for O(1) progress tracking
+      g_atomic_int_inc(&(conf->tables_all_done));
 //      return FALSE;
     }else{
 //      return 

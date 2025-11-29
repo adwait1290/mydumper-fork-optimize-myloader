@@ -22,6 +22,7 @@ struct fifo{
   gchar *filename;
   gchar *stdout_filename;
   GMutex *mutex;
+  gboolean uses_decompressor;  // FIX: Track if this FIFO uses a decompressor slot
 };
 
 void initialize_process(struct configuration *c);

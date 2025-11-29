@@ -35,7 +35,9 @@ guint schema_processed_counter = 0;
 GAsyncQueue *process_file_type_queue = NULL;
 //GThread *stream_process_filename_thread = NULL;
 struct configuration *process_file_type_conf;
-guint process_file_type_num_threads=4;
+// OPTIMIZATION: Increase file type processing threads for faster file classification
+// This helps when there are many files to process (6000+ tables = 12000+ files)
+guint process_file_type_num_threads=8;
 GThread ** process_file_type_workers;
 void *process_file_type_worker(void *data);
 guint amount_of_files=0;

@@ -90,7 +90,9 @@ void schema_ended(){
   schema_job_queue_push(new_schema_job(SCHEMA_PROCESS_ENDED, NULL, NULL));
 }
 
-// _database is locked
+// IMPORTANT: Caller MUST hold _database->mutex before calling this function
+// This ensures atomicity between checking schema_state and draining table_queue
+// in schema_push() vs this function's operations
 static
 void set_db_schema_created(struct database * _database)
 {
@@ -138,8 +140,14 @@ void set_table_schema_state_to_created (struct configuration *conf){
   while (iter != NULL){
     dbt=iter->data;
     table_lock(dbt);
-    if (dbt->schema_state == NOT_FOUND )
+    if (dbt->schema_state == NOT_FOUND ) {
       dbt->schema_state = CREATED;
+      // FIX: Use g_cond_broadcast to wake ALL waiting data workers
+      g_cond_broadcast(dbt->schema_cond);
+      g_atomic_int_inc(&(conf->tables_created));
+      // OPTIMIZATION: Enqueue table to ready queue if it has pending jobs
+      enqueue_table_if_ready_locked(conf, dbt);
+    }
     table_unlock(dbt);
     iter=iter->next;
   }
@@ -150,34 +158,42 @@ gboolean second_round=FALSE;
 /* @return TRUE: continue worker_schema_thread() loop */
 gboolean process_schema(struct thread_data * td){
   struct database * _database = NULL;
-  struct control_job *job = NULL;
+  // NOTE: Removed unused 'struct control_job *job = NULL;' declaration
+  // The old code had a bug where it pushed 'job' (NULL) to retry_queue instead of 'schema_job'
 
   struct schema_job * schema_job = g_async_queue_pop(schema_job_queue);
-  trace("schema_job_queue -> %s", schema_job_type2str(schema_job->type));
+
+  trace("S-Thread %d: Processing %s", td->thread_id, schema_job_type2str(schema_job->type));
 
   switch (schema_job->type){
     case SCHEMA_CREATE_JOB:
       _database=schema_job->restore_job->data.srj->database;
-      trace("database_queue -> %s", _database->source_database);
+      trace("S-Thread %d: Creating database schema: %s", td->thread_id, _database->source_database);
       g_mutex_lock(_database->mutex);
       process_restore_job(td, schema_job->restore_job);
-      //      ret=process_job(td, job, NULL);
       set_db_schema_created(_database);
-      trace("Set DB created: %s", _database->source_database);
       g_mutex_unlock(_database->mutex);
       break;
     case SCHEMA_SEQUENCE_JOB:
     case SCHEMA_TABLE_JOB:
-      if (process_restore_job(td, schema_job->restore_job)){
-        trace("retry_queue <- ");
-        g_async_queue_push(retry_queue, job);
+      if (schema_job->restore_job && schema_job->restore_job->dbt) {
+        trace("S-Thread %d: Processing %s for %s.%s",
+              td->thread_id, schema_job_type2str(schema_job->type),
+              schema_job->restore_job->dbt->database->target_database,
+              schema_job->restore_job->dbt->source_table_name);
+      }
+      int result = process_restore_job(td, schema_job->restore_job);
+      if (result){
+        // BUG FIX: Was pushing 'job' (NULL) instead of 'schema_job'!
+        // This caused failed schema jobs to be silently lost instead of retried.
+        g_async_queue_push(retry_queue, schema_job);
       }
       wake_data_threads();
       break;
     case SCHEMA_PROCESS_ENDED:
-      // set as created all database, 
+      // set as created all database,
       // which implies all tables are created
-      trace("SCHEMA_PROCESS_ENDED ");
+      trace("SCHEMA_PROCESS_ENDED");
       schema_job = g_async_queue_try_pop(retry_queue);
       while (schema_job){
         schema_job_queue_push(schema_job);
@@ -188,12 +204,15 @@ gboolean process_schema(struct thread_data * td){
       gpointer _key;
       g_hash_table_iter_init (&iter, database_hash);
       while (g_hash_table_iter_next (&iter, &_key, (gpointer) &_database)){
+        // FIX: Hold database mutex to prevent race condition with schema_push()
+        // Without this, schema_push() could push to _database->table_queue AFTER
+        // set_db_schema_created() drains it, causing the job to be lost
+        g_mutex_lock(_database->mutex);
         set_db_schema_created(_database);
+        g_mutex_unlock(_database->mutex);
       }
-      
-      schema_job_queue_push(new_schema_job(SCHEMA_ENDED, NULL, NULL));
 
-      //refresh_table_list(td->conf);
+      schema_job_queue_push(new_schema_job(SCHEMA_ENDED, NULL, NULL));
       break;
 
     case SCHEMA_ENDED:
@@ -201,7 +220,9 @@ gboolean process_schema(struct thread_data * td){
       //refresh_table_list(td->conf);
       return FALSE;
       break;
-                          
+    default:
+      g_critical("[SCHEMA_WORKER] Thread %d: UNEXPECTED job type %d (not in switch!)", td->thread_id, schema_job->type);
+      break;
   }
 
   return TRUE;
@@ -209,9 +230,7 @@ gboolean process_schema(struct thread_data * td){
 
 void *worker_schema_thread(struct thread_data *td) {
   struct configuration *conf = td->conf;
-
   g_async_queue_push(conf->ready, GINT_TO_POINTER(1));
-
   set_thread_name("S%02u", td->thread_id);
   message("S-Thread %u: Starting import", td->thread_id);
   gboolean cont=TRUE;
@@ -232,23 +251,30 @@ void initialize_worker_schema(struct configuration *conf){
   retry_queue = g_async_queue_new();
   schema_threads = g_new(GThread *, max_threads_for_schema_creation);
   schema_td = g_new(struct thread_data, max_threads_for_schema_creation);
-  g_message("Initializing initialize_worker_schema");
-  for (n = 0; n < max_threads_for_schema_creation; n++) 
+  for (n = 0; n < max_threads_for_schema_creation; n++)
     initialize_thread_data(&(schema_td[n]), conf, WAITING, n + 1 + num_threads, NULL);
-
-//  if (stream)
-//    schema_job_queue_push(CJT_RESUME, "");
 }
 
 void start_worker_schema(){
   guint n=0;
-  for (n = 0; n < max_threads_for_schema_creation; n++)
+  for (n = 0; n < max_threads_for_schema_creation; n++) {
     schema_threads[n] =
         m_thread_new("myloader_schema",(GThreadFunc)worker_schema_thread, &schema_td[n], "Schema thread could not be created");
+  }
 }
 
 
 void wait_schema_worker_to_finish(struct configuration *conf){
+  // FIX: In --no-data mode, send JOB_SHUTDOWN to index threads BEFORE waiting
+  // for schema workers to prevent deadlock
+  if (no_data && conf->index_queue != NULL) {
+    guint num_index_threads = max_threads_for_index_creation > 0 ? max_threads_for_index_creation : num_threads;
+    trace("--no-data mode: Sending JOB_SHUTDOWN to %u index threads", num_index_threads);
+    for (guint i = 0; i < num_index_threads; i++) {
+      g_async_queue_push(conf->index_queue, new_control_job(JOB_SHUTDOWN, NULL, NULL));
+    }
+  }
+
   guint n=0;
   trace("Waiting schema worker to finish");
   for (n = 0; n < max_threads_for_schema_creation; n++) {
@@ -257,6 +283,7 @@ void wait_schema_worker_to_finish(struct configuration *conf){
   // As all schema worker has finished, we need to let the process continue and set all tables as created
   set_table_schema_state_to_created(conf);
   data_control_queue_push(FILE_TYPE_ENDED);
+
   trace("Schema worker finished");
 }
 

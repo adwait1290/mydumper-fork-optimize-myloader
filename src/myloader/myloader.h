@@ -108,6 +108,11 @@ struct configuration {
   GAsyncQueue *index_queue;
   int done;
   GOptionContext * context;
+  // OPTIMIZATION: Atomic counters for O(1) progress tracking instead of O(n) hash iteration
+  gint tables_created;   // Atomic counter for tables that reached CREATED state
+  gint tables_all_done;  // Atomic counter for tables that reached ALL_DONE state
+  // OPTIMIZATION: Ready queue for O(1) job dispatch instead of O(n) table scan
+  GAsyncQueue *ready_table_queue;  // Tables with pending jobs ready for dispatch
 };
 
 

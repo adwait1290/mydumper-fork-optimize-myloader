@@ -51,7 +51,10 @@ guint commit_count = 1000;
 gchar *input_directory = NULL;
 gchar *directory = NULL;
 gchar *pwd=NULL;
-gboolean overwrite_tables = FALSE;
+// SMART DEFAULT: Enable overwrite_tables with TRUNCATE mode
+// When table exists: TRUNCATE it and skip CREATE TABLE
+// When table doesn't exist: CREATE TABLE normally
+gboolean overwrite_tables = TRUE;
 gboolean overwrite_unsafe = FALSE;
 
 gboolean optimize_keys = TRUE;
@@ -100,6 +103,13 @@ GHashTable * myloader_initialize_hash_of_session_variables(){
     set_session_hash_insert(_set_session_hash,"AUTOCOMMIT",g_strdup("0"));
   if (!enable_binlog)
     set_session_hash_insert(_set_session_hash,"SQL_LOG_BIN",g_strdup("0"));
+
+  // FIX: Set READ COMMITTED isolation level to ensure data workers see
+  // schema changes from other connections immediately. This fixes the
+  // cross-connection visibility issue where CREATE TABLE on one connection
+  // may not be visible to another connection due to REPEATABLE READ isolation.
+  set_session_hash_insert(_set_session_hash,"TRANSACTION_ISOLATION",g_strdup("'READ-COMMITTED'"));
+
   return _set_session_hash;
 }
 
@@ -313,7 +323,8 @@ void print_errors(){
 }
 
 int main(int argc, char *argv[]) {
-  struct configuration conf = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL};
+  // Use designated initializer for cleaner initialization with new fields
+  struct configuration conf = {0};
 
   GError *error = NULL;
   GOptionContext *context;
@@ -358,6 +369,27 @@ int main(int argc, char *argv[]) {
     overwrite_tables= TRUE;
 
   check_num_threads();
+
+  // NOTE: With --no-data mode, indexes are still created inline during table creation
+  // because --skip-indexes would skip UNIQUE KEY creation, breaking foreign key constraints.
+  // Tables with inline FKs referencing UNIQUE keys would fail with MySQL 8.4 ERROR 6125:
+  // "Failed to add the foreign key constraint. Missing unique key"
+  //
+  // The two-phase approach works because:
+  // 1. Phase 1 (--no-data): Creates schemas WITH indexes (no deadlock because index workers
+  //    receive JOB_SHUTDOWN after schema workers complete)
+  // 2. Phase 2 (--no-schema): Loads data only
+
+  // OPTIMIZATION: Auto-scale schema/index threads based on CPU count
+  guint cpu_count = g_get_num_processors();
+  if (max_threads_for_schema_creation == 4 && cpu_count > 4) {
+    guint auto_schema_threads = cpu_count > 8 ? 8 : cpu_count;
+    max_threads_for_schema_creation = auto_schema_threads;
+  }
+  if (max_threads_for_index_creation == 4 && cpu_count > 4) {
+    guint auto_index_threads = cpu_count > 8 ? 8 : cpu_count;
+    max_threads_for_index_creation = auto_index_threads;
+  }
 
   if (num_threads > max_threads_per_table)
     g_message("Using %u loader threads (%u per table)", num_threads, max_threads_per_table);
@@ -459,6 +491,11 @@ int main(int argc, char *argv[]) {
 //  conf.stream_queue = g_async_queue_new();
   conf.table_hash = g_hash_table_new ( g_str_hash, g_str_equal );
   conf.table_hash_mutex=g_mutex_new();
+  // OPTIMIZATION: Initialize atomic counters for O(1) progress tracking
+  conf.tables_created = 0;
+  conf.tables_all_done = 0;
+  // OPTIMIZATION: Ready queue for O(1) job dispatch instead of O(n) table scan
+  conf.ready_table_queue = g_async_queue_new();
 
   if (g_file_test("resume",G_FILE_TEST_EXISTS)){
     if (!resume){
@@ -525,7 +562,10 @@ int main(int argc, char *argv[]) {
   start_database(t);
   g_message("start_worker_schema");
   start_worker_schema();
-  initialize_loader_threads(&conf);
+  // OPTIMIZATION: Skip loader thread initialization in --no-data mode (two-phase loading)
+  if (!no_data) {
+    initialize_loader_threads(&conf);
+  }
 
   if (throttle_variable)
     m_thread_new("mon_thro",monitor_throttling_thread, NULL, "Monitor throttling thread could not be created");

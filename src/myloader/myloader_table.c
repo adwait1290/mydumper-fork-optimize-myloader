@@ -95,6 +95,7 @@ gboolean append_new_db_table( struct db_table **p_dbt, struct database *_databas
       dbt->max_connections_per_job=0;
       dbt->retry_count= retry_count;
       dbt->mutex=g_mutex_new();
+      dbt->schema_cond=g_cond_new();  // OPTIMIZATION: Condition variable for schema-wait
 //      dbt->indexes=alter_table_statement;
       dbt->indexes=NULL;
       dbt->start_data_time=NULL;
@@ -115,6 +116,9 @@ gboolean append_new_db_table( struct db_table **p_dbt, struct database *_databas
       dbt->data_checksum=NULL;
       dbt->is_view=FALSE;
       dbt->is_sequence=FALSE;
+      // OPTIMIZATION: Initialize job count and ready queue flag
+      dbt->job_count=0;
+      dbt->in_ready_queue=FALSE;
     }else{
 //      g_free(source_table_name);
       g_free(lkey);

@@ -34,6 +34,9 @@
 extern gboolean help;
 guint errors=0;
 GList *ignore_errors_list=NULL;
+// OPTIMIZATION: Hash set for O(1) ignore_errors lookup instead of O(n) g_list_find
+// Built from ignore_errors_list after parsing command line
+GHashTable *ignore_errors_set=NULL;
 GAsyncQueue *stream_queue = NULL;
 gboolean use_defer= FALSE;
 gboolean check_row_count= FALSE;
@@ -838,6 +841,9 @@ GRecMutex * g_rec_mutex_new(){
 /*
   Read one line of data terminated by \n or maybe not terminated in case of EOF.
 
+  OPTIMIZATION: Use larger buffer and fread for better I/O performance.
+  The original 4KB buffer caused many small reads. Using 64KB reduces syscalls.
+
   FIXME: passing both *eof and *line here makes no sense. The caller may increment
   line by this condition:
 
@@ -846,17 +852,28 @@ GRecMutex * g_rec_mutex_new(){
 */
 gboolean read_data(FILE *file, GString *data,
                    gboolean *eof, guint *line) {
-  char buffer[4096];
-  size_t l;
+  // OPTIMIZATION: Larger buffer reduces syscall overhead significantly
+  // For data files with large INSERT statements, this is a major win
+  char buffer[65536];
 
   while (fgets(buffer, sizeof(buffer), file)) {
-    l= strlen(buffer);
-    //g_assert(l > 0 && l < sizeof(buffer));
-    g_string_append(data, buffer);
-    if (buffer[l - 1] == '\n') {
+    // OPTIMIZATION: Use memchr to find newline instead of strlen
+    // This is O(n) but stops at the newline, not the end of buffer
+    // For LOAD DATA files with tab-separated values, this is much faster
+    // than strlen() which scans to the NUL terminator
+    char *newline = memchr(buffer, '\n', sizeof(buffer));
+    size_t l;
+    if (newline) {
+      l = newline - buffer + 1;  // Include the newline
+      g_string_append_len(data, buffer, l);
       (*line)++;
-      *eof= FALSE;
+      *eof = FALSE;
       return TRUE;
+    } else {
+      // No newline found - line continues in next read
+      // Use strlen since we need to know where the NUL is
+      l = strlen(buffer);
+      g_string_append_len(data, buffer, l);
     }
   }
 
@@ -1303,10 +1320,22 @@ void discard_mysql_output(MYSQL *conn){
   }
 }
 
+// OPTIMIZATION: O(1) error code lookup using hash set
+static inline gboolean ignore_error_code(guint error_code) {
+  if (ignore_errors_set == NULL) return FALSE;
+  return g_hash_table_contains(ignore_errors_set, GINT_TO_POINTER(error_code));
+}
+
+// Public version for use in other files (myloader_restore.c)
+gboolean should_ignore_error_code(guint error_code) {
+  return ignore_error_code(error_code);
+}
+
 static void m_log(MYSQL *conn, void log_fun_1(const char *, ...), void log_fun_2(const char *, ...), const char *fmt, va_list args){
   if (fmt && log_fun_1){
     gchar *c=g_strdup_vprintf(fmt,args);
-    if (log_fun_2 && g_list_find(ignore_errors_list, GINT_TO_POINTER(mysql_errno(conn))))
+    // OPTIMIZATION: Use O(1) hash lookup instead of O(n) list scan
+    if (log_fun_2 && ignore_error_code(mysql_errno(conn)))
       log_fun_2("%s - ERROR %d: %s",c, mysql_errno(conn), mysql_error(conn));
     else{
       if (mysql_errno(conn)){
@@ -1331,40 +1360,44 @@ static gboolean m_queryv(  MYSQL *conn, const gchar *query, void log_fun_1(const
 
 gboolean m_query(  MYSQL *conn, const gchar *query, void log_fun(const char *, ...) , const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_queryv(conn, query, log_fun, NULL, fmt,args);
+  va_start(args, fmt);
+  gboolean result = m_queryv(conn, query, log_fun, NULL, fmt, args);
+  va_end(args);
+  return result;
 }
 
 // Executes the query, if there is an error it send critical stopping the process unless the error is ignored
 gboolean m_query_warning(  MYSQL *conn, const gchar *query, const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_queryv(conn, query, m_warning, NULL, fmt,args);
+  va_start(args, fmt);
+  gboolean result = m_queryv(conn, query, m_warning, NULL, fmt, args);
+  va_end(args);
+  return result;
 }
 
 // Executes the query, if there is an error it send critical stopping the process unless the error is ignored
 gboolean m_query_critical(  MYSQL *conn, const gchar *query, const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_queryv(conn, query, m_critical, m_warning, fmt,args);
+  va_start(args, fmt);
+  gboolean result = m_queryv(conn, query, m_critical, m_warning, fmt, args);
+  va_end(args);
+  return result;
 }
 
 
 gboolean m_query_ext(  MYSQL *conn, const gchar *query, void log_fun_1(const char *, ...), void log_fun_2(const char *, ...), const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_queryv(conn, query, log_fun_1, log_fun_2, fmt,args);
+  va_start(args, fmt);
+  gboolean result = m_queryv(conn, query, log_fun_1, log_fun_2, fmt, args);
+  va_end(args);
+  return result;
 }
 
 gboolean m_query_verbose(MYSQL *conn, const char *q, void log_fun(const char *, ...) , const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  gboolean res= m_queryv(conn, q, log_fun, NULL, fmt, args);
+  va_start(args, fmt);
+  gboolean res = m_queryv(conn, q, log_fun, NULL, fmt, args);
+  va_end(args);
   if (!res)
     g_message("%s: OK", q);
   return res;
@@ -1382,50 +1415,55 @@ MYSQL_RES *m_resultv(MYSQL_RES * m_result(MYSQL *), MYSQL *conn, const gchar *qu
 
 MYSQL_RES *m_store_result_critical(MYSQL *conn, const gchar *query, const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_resultv(mysql_store_result, conn, query, m_critical, m_warning, fmt, args);
+  va_start(args, fmt);
+  MYSQL_RES *result = m_resultv(mysql_store_result, conn, query, m_critical, m_warning, fmt, args);
+  va_end(args);
+  return result;
 }
 
 MYSQL_RES *m_store_result(MYSQL *conn, const gchar *query, void log_fun(const char *, ...) , const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_resultv(mysql_store_result, conn, query, log_fun, NULL, fmt, args);
+  va_start(args, fmt);
+  MYSQL_RES *result = m_resultv(mysql_store_result, conn, query, log_fun, NULL, fmt, args);
+  va_end(args);
+  return result;
 }
 
 MYSQL_RES *m_use_result(MYSQL *conn, const gchar *query, void log_fun(const char *, ...) , const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
-  return m_resultv(mysql_use_result, conn, query, log_fun, NULL, fmt, args);
+  va_start(args, fmt);
+  MYSQL_RES *result = m_resultv(mysql_use_result, conn, query, log_fun, NULL, fmt, args);
+  va_end(args);
+  return result;
 }
 
 struct M_ROW* m_store_result_row(MYSQL *conn, const gchar *query, void log_fun_1(const char *, ...), void log_fun_2(const char *, ...), const char *fmt, ...){
   va_list args;
-  if (fmt)
-    va_start(args, fmt);
+  va_start(args, fmt);
   struct M_ROW *mr=g_new0(struct M_ROW,1);
   mr->row=NULL;
   mr->res = m_resultv(mysql_store_result, conn, query, log_fun_1, log_fun_2, fmt, args);
+  va_end(args);
   if (mr->res)
     mr->row= mysql_fetch_row(mr->res);
   return mr;
 }
 
 struct M_ROW* m_store_result_single_row(MYSQL *conn, const gchar *query, const char *fmt, ...){
-  va_list args;
-  if (fmt)
-    va_start(args, fmt);
+  va_list args, args2;
+  va_start(args, fmt);
+  va_copy(args2, args);
   struct M_ROW *mr=g_new0(struct M_ROW,1);
   mr->row=NULL;
   mr->res = m_resultv(mysql_store_result, conn, query, m_critical, m_warning, fmt, args);
+  va_end(args);
   if (mr->res){
     mr->row= mysql_fetch_row(mr->res);
 
     if (!mr->row)
-      m_log(conn, m_critical, m_warning, fmt, args);
+      m_log(conn, m_critical, m_warning, fmt, args2);
   }
+  va_end(args2);
   return mr;
 }
 

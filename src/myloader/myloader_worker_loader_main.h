@@ -57,4 +57,10 @@ void data_control_queue_push(enum data_control_type current_ft);
 struct restore_job * request_next_data_job();
 void wake_data_threads();
 
+// OPTIMIZATION: Ready table queue functions for O(1) dispatch
+// These functions manage the queue of tables ready for data loading
+// A table is "ready" when: schema_state == CREATED && job_count > 0 && current_threads < max_threads
+void enqueue_table_if_ready(struct configuration *conf, struct db_table *dbt);
+void enqueue_table_if_ready_locked(struct configuration *conf, struct db_table *dbt);
+
 #endif

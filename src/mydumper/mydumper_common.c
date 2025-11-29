@@ -97,7 +97,8 @@ gchar * build_schema_table_filename(char *database, char *table, const char *suf
 }
 
 gchar * build_schema_filename(const char *database, const char *suffix){
-  GString *filename = g_string_sized_new(20);
+  // OPTIMIZATION: Larger initial buffer for typical db.table-suffix.sql filenames
+  GString *filename = g_string_sized_new(128);
   g_string_append_printf(filename, "%s-%s.sql", database, suffix);
   gchar *r = g_build_filename(dump_directory, filename->str, NULL);
   g_string_free(filename,TRUE);
@@ -109,7 +110,8 @@ gchar * build_tablespace_filename(){
 }
 
 gchar * build_meta_filename(char *database, char *table, const char *suffix){
-  GString *filename = g_string_sized_new(20);
+  // OPTIMIZATION: Larger initial buffer for typical db.table-suffix filenames
+  GString *filename = g_string_sized_new(128);
   if (table != NULL)
     g_string_append_printf(filename, "%s.%s-%s", database, table, suffix);
   else
@@ -196,7 +198,8 @@ void set_transaction_isolation_level_repeatable_read(MYSQL *conn){
 // Global Var used:
 // - dump_directory
 gchar * build_filename(char *database, char *table, guint64 part, guint sub_part, const gchar *extension, const gchar *second_extension){
-  GString *filename = g_string_sized_new(20);
+  // OPTIMIZATION: Larger initial buffer for typical db.table.00001.sql filenames
+  GString *filename = g_string_sized_new(128);
   sub_part == 0 ?
     g_string_append_printf(filename, "%s.%s.%05"G_GINT64_FORMAT".%s%s%s", database, table, part, extension, second_extension!=NULL ?".":"",second_extension!=NULL ?second_extension:"" ):
     g_string_append_printf(filename, "%s.%s.%05"G_GINT64_FORMAT".%05u.%s%s%s", database, table, part, sub_part, extension, second_extension!=NULL ?".":"",second_extension!=NULL ?second_extension:"");
@@ -293,30 +296,73 @@ unsigned long m_real_escape_string(MYSQL *conn, char *to, const gchar *from, uns
          (size_t)(to - to_start);
 }
 
-void m_escape_char_with_char(gchar neddle, gchar repl, gchar *to, unsigned long length){
-  gchar *ffrom=g_new(char, length);
-  memcpy(ffrom, to, length);
-  gchar *from=ffrom;
-  const char *end = from + length;
-  for (end = from + length; from < end; from++) {
-    if ( *from == neddle ){
-      *to = repl;
-      to++;
-    }
-    *to=*from;
-    to++;
+// OPTIMIZATION: Allocation-free m_escape_char_with_char using reverse iteration
+// The original function allocated a temp buffer for EVERY column processed.
+// This version works backwards from the end, using the extra space in the buffer
+// (caller must ensure buffer has 2x capacity for worst case).
+//
+// Algorithm: Scan forward with memchr to count needles, then copy backwards
+// This avoids overwriting unprocessed data and eliminates allocation.
+// Returns: new length of the string after escaping
+unsigned long m_escape_char_with_char(gchar needle, gchar repl, gchar *str, unsigned long length){
+  if (length == 0) return 0;
+
+  // OPTIMIZATION: Use memchr for fast needle counting (SIMD-optimized in glibc)
+  // Count how many escapes we need to insert
+  unsigned long escape_count = 0;
+  const gchar *scan = str;
+  const gchar *end = str + length;
+  while (scan < end) {
+    const gchar *found = memchr(scan, needle, end - scan);
+    if (!found) break;
+    escape_count++;
+    scan = found + 1;
   }
-  *to='\0';
-  g_free(ffrom);
+
+  // Fast path: no escapes needed
+  if (escape_count == 0) {
+    str[length] = '\0';
+    return length;
+  }
+
+  // Work backwards: final length = original + escape_count
+  // Each needle becomes: repl + needle (2 chars instead of 1)
+  unsigned long new_length = length + escape_count;
+  gchar *write_ptr = str + new_length;
+  *write_ptr = '\0';  // Null terminate
+
+  const gchar *read_ptr = str + length - 1;
+  write_ptr--;
+
+  // Copy backwards, inserting escape chars as we go
+  while (read_ptr >= str) {
+    *write_ptr = *read_ptr;
+    if (*read_ptr == needle) {
+      write_ptr--;
+      *write_ptr = repl;
+    }
+    write_ptr--;
+    read_ptr--;
+  }
+  return new_length;
 }
 
-void m_replace_char_with_char(gchar neddle, gchar repl, gchar *from, unsigned long length){
-  const char *end = from + length;
-  for (end = from + length; from < end; from++) {
-    if ( *from == neddle ){
-      *from = repl;
-      from++;
-    }
+// OPTIMIZATION: Use memchr for fast needle finding (SIMD-optimized in glibc/musl)
+// memchr uses SSE4.2/AVX2 on x86 and NEON on ARM for vectorized scanning.
+// This replaces the byte-by-byte loop with O(n/16) or O(n/32) vectorized scans.
+void m_replace_char_with_char(gchar needle, gchar repl, gchar *str, unsigned long length){
+  if (length == 0) return;
+
+  gchar *ptr = str;
+  const gchar *end = str + length;
+
+  // Use memchr to jump to each needle location
+  // memchr is SIMD-optimized: scans 16-32 bytes at a time
+  while (ptr < end) {
+    gchar *found = memchr(ptr, needle, end - ptr);
+    if (!found) break;
+    *found = repl;
+    ptr = found + 1;
   }
 }
 

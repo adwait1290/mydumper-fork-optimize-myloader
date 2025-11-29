@@ -43,6 +43,10 @@ struct thread_data {
   gchar *binlog_snapshot_gtid_executed;
   GMutex *pause_resume_mutex;
   struct thread_data_buffers thread_data_buffers;
+  // OPTIMIZATION: Thread-local row counter to batch updates and reduce lock contention
+  // Flush to shared counter every ROW_BATCH_FLUSH_THRESHOLD rows
+  guint64 local_row_count;
+  struct db_table *local_row_count_dbt;  // Track which table the count belongs to
 };
 
 #endif

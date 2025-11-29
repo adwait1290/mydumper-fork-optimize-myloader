@@ -36,6 +36,7 @@ struct db_table {
   guint max_connections_per_job;
   guint retry_count;
   GMutex *mutex;
+  GCond *schema_cond;  // OPTIMIZATION: Condition variable for efficient schema-wait
   GString *indexes;
   GString *constraints;
   guint count;
@@ -52,6 +53,10 @@ struct db_table {
   gchar *triggers_checksum;
   gboolean is_view;
   gboolean is_sequence;
+  // OPTIMIZATION: Cached job count for O(1) lookup instead of O(n) g_list_length()
+  guint job_count;
+  // OPTIMIZATION: Ready queue linkage - tables with pending jobs
+  gboolean in_ready_queue;
 };
 
 struct db_table * get_table(gchar *database_name_in_filename , gchar * table_filename);

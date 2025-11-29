@@ -95,8 +95,10 @@ struct chunk_step_item *get_next_partition_chunk(struct db_table *dbt){
       return csi;
     }
 
-    if (g_list_length (csi->chunk_step->partition_step.list) > 3 ){
-      guint pos=g_list_length (csi->chunk_step->partition_step.list) / 2;
+    // OPTIMIZATION: Cache list length instead of calling g_list_length() twice (O(n) each)
+    guint list_len = g_list_length(csi->chunk_step->partition_step.list);
+    if (list_len > 3){
+      guint pos = list_len / 2;
       GList *new_list=g_list_nth(csi->chunk_step->partition_step.list,pos);
       new_list->prev->next=NULL;
       new_list->prev=NULL;

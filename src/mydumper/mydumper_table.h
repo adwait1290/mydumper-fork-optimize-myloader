@@ -58,6 +58,7 @@ struct db_table {
   GMutex *chunks_mutex;
   GAsyncQueue *chunks_queue;
   GList *primary_key;
+  guint primary_key_count;  // OPTIMIZATION: Cache count to avoid O(n) g_list_length()
   gchar *primary_key_separated_by_comma;
   gboolean multicolumn;
   gint * chunks_completed;
@@ -83,4 +84,6 @@ void free_db_table(struct db_table * dbt);
 gboolean new_db_table(struct db_table **d, MYSQL *conn, struct configuration *conf,
                       struct database *database, char *table, char *table_collation,
                       gboolean is_sequence);
+// OPTIMIZATION: Prefetch table metadata in bulk to avoid 250K+ per-table queries
+void prefetch_table_metadata(MYSQL *conn);
 

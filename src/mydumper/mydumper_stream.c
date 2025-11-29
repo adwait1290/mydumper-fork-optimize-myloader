@@ -74,12 +74,12 @@ void *process_stream(void *data){
         g_async_queue_push(sf->done, GINT_TO_POINTER(1));
       break;
     }
+    // OPTIMIZATION: Combine 3 small writes into 1 to reduce syscall overhead
     char *used_filemame=g_path_get_basename(sf->filename);
-    len=write(fileno(stdout), "\n-- ", 4);
-    len=write(fileno(stdout), used_filemame, strlen(used_filemame));
-    len=write(fileno(stdout), " ", 1);
-    total_size+=5;
-    total_size+=strlen(used_filemame);
+    gchar *header = g_strdup_printf("\n-- %s ", used_filemame);
+    len=write(fileno(stdout), header, strlen(header));
+    total_size += strlen(header);
+    g_free(header);
     free(used_filemame);
     if (no_stream){
       f=write(fileno(stdout), "0\n", 2);
@@ -111,14 +111,15 @@ void *process_stream(void *data){
         
 //        g_message("File size of %s is %"G_GINT64_FORMAT, sf->filename, size);
 //        g_message("Streaming file %s", sf->filename);
-        gchar *c = g_strdup_printf("%"G_GINT64_FORMAT,size);
+        // OPTIMIZATION: Combine size + newline into single write
+        gchar *c = g_strdup_printf("%"G_GINT64_FORMAT"\n",size);
         len=write(fileno(stdout), c, strlen(c));
-        len=write(fileno(stdout), "\n", 1);
-        total_size+=strlen(c) + 1;
+        total_size+=strlen(c);
         g_free(c);
 
         guint total_len=0;
-        GDateTime *start_time=g_date_time_new_now_local();
+        // OPTIMIZATION: Use monotonic time instead of GDateTime (avoids alloc/free per file)
+        gint64 start_time_mono = g_get_monotonic_time();
         buflen = read(f, buf, STREAM_BUFFER_SIZE);
         while(buflen > 0){
           len=write(fileno(stdout), buf, buflen);
@@ -128,9 +129,10 @@ void *process_stream(void *data){
           buflen = read(f, buf, STREAM_BUFFER_SIZE);
         }
 //        g_message("Bytes readed of %s is %d", filename, total_len);
+        gint64 end_time_mono = g_get_monotonic_time();
+        diff = (end_time_mono - start_time_mono) / G_TIME_SPAN_SECOND;
+        // For total_diff, we still need to use GDateTime for accurate wall-clock time
         datetime = g_date_time_new_now_local();
-        diff=g_date_time_difference(datetime,start_time)/G_TIME_SPAN_SECOND;
-        g_date_time_unref(start_time);
         total_diff=g_date_time_difference(datetime,total_start_time)/G_TIME_SPAN_SECOND;
         g_date_time_unref(datetime);
         if (diff > 0){
@@ -213,7 +215,8 @@ void *metadata_partial_writer(void *data){
     current_datetime = g_date_time_new_now_local();
     diff=g_date_time_difference(current_datetime,prev_datetime)/G_TIME_SPAN_SECOND;
     if (diff > METADATA_PARTIAL_INTERVAL){
-      if (g_list_length(dbt_list) > 0){  
+      // OPTIMIZATION: Use NULL check O(1) instead of g_list_length() O(n)
+      if (dbt_list != NULL){
         filename= make_partial_filename(i);
         i++;
         initialize_config_on_string(output);
