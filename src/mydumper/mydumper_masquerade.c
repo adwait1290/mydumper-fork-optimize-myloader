@@ -73,7 +73,8 @@ GHashTable * load_file_into_file_hash(gchar *filename){
   if (file_content==NULL){
     file_content=load_file_content(filename);
     g_hash_table_insert(file_hash,g_strdup(filename),file_content);
-    file_content=g_hash_table_lookup(file_hash,filename);
+    // OPTIMIZATION: Removed redundant g_hash_table_lookup after insert
+    // file_content already holds the correct value from load_file_content()
   }
   return file_content;
 }
@@ -217,7 +218,9 @@ gboolean apply_format_item(gchar **original_p, gulong* max_len, struct format_it
         guint random_length       = fid->min < fid->max ?(guint) g_random_int_range(fid->min, (*max_len - *pos_in_string < fid->max ? *max_len - *pos_in_string : fid->max) + 1): fid->min;
         guint final_random_length = *pos_in_string+ random_length  > *max_len ? *max_len - *pos_in_string : random_length;
         GList *list_of_string_of_lenght = (GList *) g_hash_table_lookup((GHashTable *)fid->data,GINT_TO_POINTER(final_random_length));
-        gchar *lala=g_list_nth_data(list_of_string_of_lenght, g_random_int_range(0,g_list_length(list_of_string_of_lenght)));
+        // OPTIMIZATION: Cache list length instead of calling O(n) g_list_length() in hot path
+        guint list_len = g_list_length(list_of_string_of_lenght);
+        gchar *lala = g_list_nth_data(list_of_string_of_lenght, g_random_int_range(0, list_len));
 //        g_message("pos_in_string: %d | Max len: %ld | random_length: %d | final_random_length: %d | Original: |%s| String: |%s|", *pos_in_string, *max_len,random_length,final_random_length, *original_p, lala);
         g_strlcpy(&((*original_p)[*pos_in_string]), lala , final_random_length+1);
         *pos_in_string+=final_random_length;
@@ -415,8 +418,10 @@ void parse_regex_function(struct function_pointer * fp, gchar *val){
       val++;
   }
 
-  if (g_list_length(fp->parse)%2 != 0)
-    g_error("Parsing regex function failed. Elements found: %d but even amount of elements are allowed", g_list_length(fp->parse));
+  // OPTIMIZATION: Cache list length instead of calling g_list_length() twice
+  guint parse_len = g_list_length(fp->parse);
+  if (parse_len % 2 != 0)
+    g_error("Parsing regex function failed. Elements found: %d but even amount of elements are allowed", parse_len);
 
 }
 
@@ -443,8 +448,10 @@ void parse_apply_function(struct function_pointer * fp, gchar *val){
       val++;
   }
 
-  if (g_list_length(fp->parse)>2 || g_list_length(fp->parse)==0)
-    g_error("Parsing apply function failed. Elements found: %d but only 1 or 2 are allowed", g_list_length(fp->parse));
+  // OPTIMIZATION: Cache list length instead of calling g_list_length() three times
+  guint apply_parse_len = g_list_length(fp->parse);
+  if (apply_parse_len > 2 || apply_parse_len == 0)
+    g_error("Parsing apply function failed. Elements found: %d but only 1 or 2 are allowed", apply_parse_len);
 
 }
 

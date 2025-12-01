@@ -47,7 +47,8 @@ void determine_explain_columns(MYSQL_RES *result, guint *rowscol);
 void determine_charset_and_coll_columns_from_show(MYSQL_RES *result, guint *charcol, guint *collcol);
 unsigned long m_real_escape_string(MYSQL *conn, char *to, const gchar *from, unsigned long length);
 void m_replace_char_with_char(gchar neddle, gchar replace, gchar *from, unsigned long length);
-void m_escape_char_with_char(gchar neddle, gchar replace, gchar *to, unsigned long length);
+// OPTIMIZATION: Returns new length after escaping to avoid strlen() in hot path
+unsigned long m_escape_char_with_char(gchar neddle, gchar replace, gchar *to, unsigned long length);
 void free_common();
 void initialize_sql_statement(GString *statement);
 void set_tidb_snapshot(MYSQL *conn);

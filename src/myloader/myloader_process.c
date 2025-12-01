@@ -24,6 +24,9 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include "myloader.h"
 #include "myloader_stream.h"
@@ -36,6 +39,7 @@
 #include "myloader_database.h"
 #include "myloader_directory.h"
 #include "myloader_worker_schema.h"
+#include "myloader_worker_loader_main.h"
 
 
 struct replication_statements *replication_statements=NULL;
@@ -44,6 +48,67 @@ GHashTable *fifo_hash=NULL;
 GMutex *fifo_table_mutex=NULL;
 struct configuration *_conf;
 extern gboolean schema_sequence_fix;
+
+// FIX: Limit concurrent decompression processes to prevent FIFO deadlock
+// When too many zstd/gzip processes are spawned simultaneously, some may die
+// before opening the FIFO, causing the parent's fopen() to block forever.
+// This semaphore limits concurrent decompressors to a safe number.
+static GCond *decompress_cond = NULL;
+static GMutex *decompress_mutex = NULL;
+static guint active_decompressors = 0;
+static guint max_decompressors = 0;  // Set based on num_threads
+
+// OPTIMIZATION: Pre-compiled regex for CREATE TABLE parsing
+// Compiling regex once instead of per-table saves significant CPU time
+// For 6000+ tables, this eliminates ~6000 regex compilations
+static GRegex *create_table_regex_backtick = NULL;
+static GRegex *create_table_regex_doublequote = NULL;
+static GMutex *regex_init_mutex = NULL;
+static volatile gint regex_initialized = 0;  // Use gint for atomic operations
+
+static void ensure_create_table_regex_initialized(void) {
+  // Use atomic read for proper memory ordering on ARM (Apple Silicon)
+  // This ensures we see all writes that happened before regex_initialized was set
+  if (g_atomic_int_get(&regex_initialized)) return;
+
+  // Safety check: ensure mutex was initialized in initialize_process()
+  // If this fails, initialize_process() wasn't called before threads started
+  if (G_UNLIKELY(regex_init_mutex == NULL)) {
+    g_critical("[REGEX] FATAL: regex_init_mutex is NULL! initialize_process() not called before threads started.");
+    // Fallback: create mutex now (still racy but better than crash)
+    regex_init_mutex = g_mutex_new();
+  }
+
+  g_mutex_lock(regex_init_mutex);
+  if (!g_atomic_int_get(&regex_initialized)) {
+    GError *err = NULL;
+    const GRegexCompileFlags flags = G_REGEX_CASELESS|G_REGEX_MULTILINE|G_REGEX_DOTALL|G_REGEX_ANCHORED|G_REGEX_RAW;
+
+    // Pre-compile for backtick identifier (most common)
+    create_table_regex_backtick = g_regex_new(
+      "CREATE\\s+TABLE\\s+[^`]*`(.+?)`\\s*\\(",
+      flags, 0, &err);
+    if (err) {
+      g_warning("[REGEX] Failed to compile backtick regex: %s", err->message);
+      g_error_free(err);
+      err = NULL;
+    }
+
+    // Pre-compile for double-quote identifier
+    create_table_regex_doublequote = g_regex_new(
+      "CREATE\\s+TABLE\\s+[^\"]*\"(.+?)\"\\s*\\(",
+      flags, 0, &err);
+    if (err) {
+      g_warning("[REGEX] Failed to compile doublequote regex: %s", err->message);
+      g_error_free(err);
+    }
+
+    // Use atomic write with memory barrier to ensure regex pointers are visible
+    // to other threads before they see regex_initialized = 1
+    g_atomic_int_set(&regex_initialized, 1);
+  }
+  g_mutex_unlock(regex_init_mutex);
+}
 
 void initialize_process(struct configuration *c){
   replication_statements=g_new(struct replication_statements,1);
@@ -55,17 +120,60 @@ void initialize_process(struct configuration *c){
   _conf=c;
   fifo_hash=g_hash_table_new(g_direct_hash,g_direct_equal);
   fifo_table_mutex = g_mutex_new();
+
+  // FIX: Initialize regex mutex HERE in single-threaded init phase
+  // Previously, this was lazily initialized in ensure_create_table_regex_initialized()
+  // which had a TOCTOU race: two threads could both see regex_init_mutex==NULL,
+  // both create a mutex, and each lock their own mutex (no actual protection!)
+  // This caused deadlock when multiple file_type_workers processed tables concurrently.
+  regex_init_mutex = g_mutex_new();
+
+  // FIX: Initialize decompression semaphore to prevent FIFO deadlock
+  // Limit concurrent decompressors to num_threads (conservative) capped at 32
+  // This prevents resource exhaustion while allowing parallelism
+  decompress_cond = g_cond_new();
+  decompress_mutex = g_mutex_new();
+  max_decompressors = num_threads;
+  if (max_decompressors > 32) max_decompressors = 32;
+  if (max_decompressors < 4) max_decompressors = 4;
 }
+
+// Helper function to release decompressor slot
+static void release_decompressor_slot(const char *context, const char *filename) {
+  (void)context;
+  (void)filename;
+  g_mutex_lock(decompress_mutex);
+  active_decompressors--;
+  g_cond_signal(decompress_cond);
+  g_mutex_unlock(decompress_mutex);
+}
+
+// Timeout for FIFO open in milliseconds (30 seconds)
+#define FIFO_OPEN_TIMEOUT_MS 30000
 
 FILE * myl_open(char *filename, const char *type){
   FILE *file=NULL;
   gchar *basename=NULL, *fifoname=NULL;
-  int child_proc;
-  (void) child_proc;
+  int child_proc = -1;
   gchar **command=NULL;
   struct stat a;
-  if (get_command_and_basename(filename, &command,&basename)){
+  gboolean uses_decompressor = FALSE;  // Track if we acquired a semaphore slot
+  gboolean slot_acquired = FALSE;      // Track if we need to release on error
 
+  if (get_command_and_basename(filename, &command,&basename)){
+    uses_decompressor = TRUE;
+
+    // FIX: Acquire semaphore slot before spawning decompressor
+    // This prevents spawning too many concurrent processes which can cause
+    // resource exhaustion and FIFO deadlocks
+    g_mutex_lock(decompress_mutex);
+
+    while (active_decompressors >= max_decompressors) {
+      g_cond_wait(decompress_cond, decompress_mutex);
+    }
+    active_decompressors++;
+    slot_acquired = TRUE;
+    g_mutex_unlock(decompress_mutex);
 
     fifoname=basename;
     if (fifo_directory != NULL){
@@ -85,11 +193,103 @@ FILE * myl_open(char *filename, const char *type){
       }
     }
     if (mkfifo(fifoname,0666)){
-      g_critical("cannot create named pipe %s (%d)", fifoname, errno); 
+      g_critical("cannot create named pipe %s (%d)", fifoname, errno);
+      // FIX: Release slot on FIFO creation failure
+      if (slot_acquired) {
+        release_decompressor_slot("mkfifo failed", filename);
+      }
+      g_free(fifoname);
+      return NULL;
     }
 
     child_proc = execute_file_per_thread(filename, fifoname, command);
-    file=g_fopen(fifoname,type);
+
+    // FIX: Health check - verify subprocess didn't die immediately
+    if (child_proc > 0) {
+      g_usleep(10000);  // Give subprocess 10ms to start
+      int status = 0;
+      pid_t result = waitpid(child_proc, &status, WNOHANG);
+      if (result == child_proc) {
+        // Process already exited - it died before opening FIFO
+        g_critical("Subprocess died immediately for %s", filename);
+        remove(fifoname);
+        if (slot_acquired) {
+          release_decompressor_slot("subprocess died", filename);
+        }
+        g_free(fifoname);
+        return NULL;
+      }
+    }
+
+    // FIX: Use non-blocking open + poll with timeout instead of blocking fopen
+    int fd = open(fifoname, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+      g_critical("Failed to open FIFO %s: %s", fifoname, strerror(errno));
+      remove(fifoname);
+      if (child_proc > 0) {
+        kill(child_proc, SIGTERM);
+        waitpid(child_proc, NULL, 0);
+      }
+      if (slot_acquired) {
+        release_decompressor_slot("open failed", filename);
+      }
+      g_free(fifoname);
+      return NULL;
+    }
+
+    // Poll with timeout for readable data
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int poll_result = poll(&pfd, 1, FIFO_OPEN_TIMEOUT_MS);
+
+    if (poll_result == 0) {
+      g_critical("Timeout waiting for subprocess to open FIFO %s", fifoname);
+      close(fd);
+      remove(fifoname);
+      if (child_proc > 0) {
+        kill(child_proc, SIGTERM);
+        waitpid(child_proc, NULL, 0);
+      }
+      if (slot_acquired) {
+        release_decompressor_slot("timeout", filename);
+      }
+      g_free(fifoname);
+      return NULL;
+    } else if (poll_result < 0) {
+      g_critical("poll() failed for FIFO %s: %s", fifoname, strerror(errno));
+      close(fd);
+      remove(fifoname);
+      if (child_proc > 0) {
+        kill(child_proc, SIGTERM);
+        waitpid(child_proc, NULL, 0);
+      }
+      if (slot_acquired) {
+        release_decompressor_slot("poll failed", filename);
+      }
+      g_free(fifoname);
+      return NULL;
+    }
+
+    // Clear non-blocking flag now that we know data is ready
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    // Convert to FILE*
+    file = fdopen(fd, type);
+    if (!file) {
+      g_critical("fdopen() failed for %s: %s", fifoname, strerror(errno));
+      close(fd);
+      remove(fifoname);
+      if (child_proc > 0) {
+        kill(child_proc, SIGTERM);
+        waitpid(child_proc, NULL, 0);
+      }
+      if (slot_acquired) {
+        release_decompressor_slot("fdopen failed", filename);
+      }
+      g_free(fifoname);
+      return NULL;
+    }
+
     g_mutex_lock(fifo_table_mutex);
     struct fifo *f=g_hash_table_lookup(fifo_hash,file);
     if (f!=NULL){
@@ -98,6 +298,7 @@ FILE * myl_open(char *filename, const char *type){
       f->pid = child_proc;
       f->filename=g_strdup(filename);
       f->stdout_filename=fifoname;
+      f->uses_decompressor = uses_decompressor;  // Track for myl_close
     }else{
       f=g_new0(struct fifo, 1);
       f->mutex=g_mutex_new();
@@ -105,6 +306,7 @@ FILE * myl_open(char *filename, const char *type){
       f->pid = child_proc;
       f->filename=g_strdup(filename);
       f->stdout_filename=fifoname;
+      f->uses_decompressor = uses_decompressor;  // Track for myl_close
       g_hash_table_insert(fifo_hash,file,f);
       g_mutex_unlock(fifo_table_mutex);
     }
@@ -135,6 +337,11 @@ void myl_close(const char *filename, FILE *file, gboolean rm){
     g_mutex_unlock(fifo_table_mutex);
 
     remove(f->stdout_filename);
+
+    // FIX: Release decompressor semaphore slot using helper function
+    if (f->uses_decompressor) {
+      release_decompressor_slot("close", filename);
+    }
   }
   if (rm){
     m_remove(NULL,filename);
@@ -150,8 +357,9 @@ static
 gboolean parse_create_table_from_file(struct db_table *dbt, gchar *filename){
   void *infile;
   gboolean eof = FALSE;
-  GString *data=g_string_sized_new(512);
-  GString *create_table_statement=g_string_sized_new(512);
+  // OPTIMIZATION: Larger initial buffer for schema files (typical CREATE TABLE is 2-10KB)
+  GString *data=g_string_sized_new(8192);
+  GString *create_table_statement=g_string_sized_new(8192);
   g_string_set_size(data,0);
   g_string_set_size(create_table_statement,0);
   guint line=0;
@@ -163,6 +371,9 @@ gboolean parse_create_table_from_file(struct db_table *dbt, gchar *filename){
     return FALSE;
   }
 
+  // OPTIMIZATION: Ensure pre-compiled regex is ready
+  ensure_create_table_regex_initialized();
+
   while (eof == FALSE) {
     if (read_data(infile, data, &eof,&line)) {
       if (g_strrstr(&data->str[data->len >= 5 ? data->len - 5 : 0], ";\n")) {
@@ -173,41 +384,60 @@ gboolean parse_create_table_from_file(struct db_table *dbt, gchar *filename){
             g_error("Identifier quote character (%s) not found on %s. Review file and configure --identifier-quote-character properly", identifier_quote_character_str, filename);
             return FALSE;
           }
-//          {
-            GError *err= NULL;
-            GMatchInfo *match_info;
-            char *expr= g_strdup_printf("CREATE\\s+TABLE\\s+[^%c]*%c(.+?)%c\\s*\\(", identifier_quote_character, identifier_quote_character, identifier_quote_character);
-            /*
-              G_REGEX_DOTALL: A dot metacharacter (".") in the pattern matches
-              all characters, including newlines. Without it, newlines are excluded. This
-              option can be changed within a pattern by a ("?s") option setting.
 
-              G_REGEX_ANCHORED: The pattern is forced to be "anchored", that is,
-              it is constrained to match only at the first matching point in the string that
-              is being searched. This effect can also be achieved by appropriate constructs in
-              the pattern itself such as the "^" metacharacter.
+          // OPTIMIZATION: Use pre-compiled regex instead of compiling per-table
+          // This saves significant CPU time for large table counts
+          GMatchInfo *match_info = NULL;
+          GRegex *regex = NULL;
 
-              G_REGEX_RAW: Usually strings must be valid UTF-8 strings, using
-              this flag they are considered as a raw sequence of bytes.
-            */
-            const GRegexCompileFlags flags= G_REGEX_CASELESS|G_REGEX_MULTILINE|G_REGEX_DOTALL|G_REGEX_ANCHORED|G_REGEX_RAW;
-            GRegex *regex= g_regex_new(expr, flags, 0, &err);
-            if (!regex)
-              goto regex_error;
+          // Select pre-compiled regex based on identifier character
+          if (identifier_quote_character == '`') {
+            regex = create_table_regex_backtick;
+          } else if (identifier_quote_character == '"') {
+            regex = create_table_regex_doublequote;
+          }
+
+          // Fall back to dynamic compilation for unusual identifier characters
+          if (regex == NULL) {
+            GError *err = NULL;
+            char *expr = g_strdup_printf("CREATE\\s+TABLE\\s+[^%c]*%c(.+?)%c\\s*\\(",
+                                         identifier_quote_character, identifier_quote_character, identifier_quote_character);
+            const GRegexCompileFlags flags = G_REGEX_CASELESS|G_REGEX_MULTILINE|G_REGEX_DOTALL|G_REGEX_ANCHORED|G_REGEX_RAW;
+            regex = g_regex_new(expr, flags, 0, &err);
+            g_free(expr);
+            if (!regex) {
+              g_error("Cannot compile regex for CREATE TABLE parsing: %s", err ? err->message : "unknown");
+              if (err) g_error_free(err);
+              return FALSE;
+            }
+            // Match with temporary regex
             if (!g_regex_match(regex, data->str, 0, &match_info) ||
                 !g_match_info_matches(match_info)) {
               g_regex_unref(regex);
-regex_error:
-              g_free(expr);
               g_error("Cannot parse real table name from CREATE TABLE statement:\n%s", data->str);
               return FALSE;
             }
-            dbt->create_table_name= g_match_info_fetch(match_info, 1);
+            dbt->create_table_name = g_match_info_fetch(match_info, 1);
+            g_match_info_free(match_info);
             g_regex_unref(regex);
-            if (!strlen(dbt->create_table_name))
-              goto regex_error;
-            g_free(expr);
-//          }
+          } else {
+            // Use pre-compiled regex (fast path)
+            if (!g_regex_match(regex, data->str, 0, &match_info) ||
+                !g_match_info_matches(match_info)) {
+              if (match_info) g_match_info_free(match_info);
+              g_error("Cannot parse real table name from CREATE TABLE statement:\n%s", data->str);
+              return FALSE;
+            }
+            dbt->create_table_name = g_match_info_fetch(match_info, 1);
+            g_match_info_free(match_info);
+            // Don't unref pre-compiled regex - it's shared
+          }
+
+          if (!dbt->create_table_name || !strlen(dbt->create_table_name)) {
+            g_error("Empty table name parsed from CREATE TABLE statement:\n%s", data->str);
+            return FALSE;
+          }
+
           if ( g_str_has_prefix(dbt->table_filename,"mydumper_") && !dbt->source_table_name){
             dbt->source_table_name=dbt->create_table_name;
 //            g_hash_table_insert(tbl_hash, dbt->table_filename, dbt->source_table_name);
@@ -228,8 +458,10 @@ regex_error:
           }
         }
         if (optimize_keys || skip_constraints || skip_indexes ){
-          GString *alter_table_statement=g_string_sized_new(512);
-          GString *alter_table_constraint_statement=g_string_sized_new(512);
+          // OPTIMIZATION: Larger initial buffers for ALTER TABLE statements
+          // Index definitions can be quite large, especially with multiple indexes
+          GString *alter_table_statement=g_string_sized_new(4096);
+          GString *alter_table_constraint_statement=g_string_sized_new(2048);
           // Check if it is a /*!40  SET
           if (g_strrstr(data->str,"/*!40")){
             g_string_append(alter_table_statement,data->str);
@@ -745,9 +977,14 @@ gboolean process_data_filename(char * filename){
     struct restore_job *rj = new_data_restore_job( g_strdup(filename), JOB_RESTORE_FILENAME, dbt, part, sub_part);
     table_lock(dbt);
     g_atomic_int_add(&(dbt->remaining_jobs), 1);
-    dbt->count++; 
+    dbt->count++;
+    // OPTIMIZATION: Maintain job_count for O(1) lookup instead of O(n) g_list_length()
+    dbt->job_count++;
     dbt->restore_job_list=g_list_insert_sorted(dbt->restore_job_list,rj,&cmp_restore_job);
 //  dbt->restore_job_list=g_list_append(dbt->restore_job_list,rj);
+    // OPTIMIZATION: Enqueue table to ready queue if schema is already created
+    // This enables O(1) dispatch instead of O(n) table list scan
+    enqueue_table_if_ready_locked(_conf, dbt);
     table_unlock(dbt);
 	}else{
     g_warning("Ignoring file %s on `%s`.`%s`",filename, dbt->database->source_database, dbt->table_filename);

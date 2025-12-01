@@ -47,8 +47,9 @@ gchar *where_option=NULL;
 
 const gchar *insert_statement=INSERT;
 guint statement_size = 1000000;
-guint64 max_statement_size=0;
-GMutex *max_statement_size_mutex=NULL;
+// OPTIMIZATION: Use volatile + atomic CAS instead of mutex for max tracking
+// This eliminates lock contention in the hot write path
+volatile guint64 max_statement_size=0;
 guint complete_insert = 0;
 guint chunk_filesize = 0;
 gboolean load_data = FALSE;
@@ -62,6 +63,18 @@ gchar *lines_starting_by=NULL;
 gchar *lines_terminated_by=NULL;
 gchar *statement_terminated_by=NULL;
 gchar *row_delimiter=NULL;
+// OPTIMIZATION: Cache delimiter lengths to avoid strlen() in hot path
+// These are called millions of times during large dumps
+guint row_delimiter_len=0;
+
+// OPTIMIZATION: Thread-local row count batching threshold
+// Flush to shared atomic counter every N rows to reduce lock contention
+// 10000 rows is a good balance between accuracy and performance
+#define ROW_BATCH_FLUSH_THRESHOLD 10000
+guint fields_terminated_by_len=0;
+guint lines_terminated_by_len=0;
+guint statement_terminated_by_len=0;
+guint lines_starting_by_len=0;
 const gchar *fields_enclosed_by_ld=NULL;
 gchar *lines_starting_by_ld=NULL;
 gchar *lines_terminated_by_ld=NULL;
@@ -90,11 +103,12 @@ gboolean update_files_on_table_job(struct table_job *tj)
 }
 
 void message_dumping_data_short(struct table_job *tj){
+  // OPTIMIZATION: Use cached count instead of O(n) g_list_length()
   g_mutex_lock(transactional_table->mutex);
-  guint transactional_table_size = g_list_length(transactional_table->list);
+  guint transactional_table_size = transactional_table->count;
   g_mutex_unlock(transactional_table->mutex);
   g_mutex_lock(non_transactional_table->mutex);
-  guint non_transactional_table_size = g_list_length(non_transactional_table->list);
+  guint non_transactional_table_size = non_transactional_table->count;
   g_mutex_unlock(non_transactional_table->mutex);
   g_message("Thread %d: %s%s%s.%s%s%s [ %"G_GINT64_FORMAT"%% ] | Tables: %u/%u",
                     tj->td->thread_id,
@@ -104,11 +118,12 @@ void message_dumping_data_short(struct table_job *tj){
 }
 
 void message_dumping_data_long(struct table_job *tj){
+  // OPTIMIZATION: Use cached count instead of O(n) g_list_length()
   g_mutex_lock(transactional_table->mutex);
-  guint transactional_table_size = g_list_length(transactional_table->list);
+  guint transactional_table_size = transactional_table->count;
   g_mutex_unlock(transactional_table->mutex);
   g_mutex_lock(non_transactional_table->mutex);
-  guint non_transactional_table_size = g_list_length(non_transactional_table->list);
+  guint non_transactional_table_size = non_transactional_table->count;
   g_mutex_unlock(non_transactional_table->mutex);
   g_message("Thread %d: dumping data from %s%s%s.%s%s%s%s%s%s%s%s%s%s%s%s%s into %s | Completed: %"G_GINT64_FORMAT"%% | Remaining tables: %u / %u",
                     tj->td->thread_id,
@@ -144,7 +159,7 @@ void initialize_write(){
   if(fields_escaped_by && strlen(fields_escaped_by)>1)
     m_critical("--fields-escaped-by must be a single character");
 
-  max_statement_size_mutex=g_mutex_new();
+  // OPTIMIZATION: Removed max_statement_size_mutex - now using atomic operations
 
   switch (output_format){
 		case CLICKHOUSE:
@@ -175,6 +190,12 @@ void initialize_write(){
         statement_terminated_by=replace_escaped_strings(g_strdup(statement_terminated_by_ld));
 
       row_delimiter=g_strdup(",");
+      // OPTIMIZATION: Cache delimiter lengths for hot path
+      row_delimiter_len=strlen(row_delimiter);
+      fields_terminated_by_len=strlen(fields_terminated_by);
+      lines_terminated_by_len=strlen(lines_terminated_by);
+      statement_terminated_by_len=strlen(statement_terminated_by);
+      lines_starting_by_len=strlen(lines_starting_by);
 			break;
 		case LOAD_DATA:
       if (!fields_enclosed_by_ld){
@@ -217,6 +238,12 @@ void initialize_write(){
         statement_terminated_by=replace_escaped_strings(g_strdup(statement_terminated_by_ld));
 
       row_delimiter=g_strdup("");
+      // OPTIMIZATION: Cache delimiter lengths for hot path
+      row_delimiter_len=strlen(row_delimiter);
+      fields_terminated_by_len=strlen(fields_terminated_by);
+      lines_terminated_by_len=strlen(lines_terminated_by);
+      statement_terminated_by_len=strlen(statement_terminated_by);
+      lines_starting_by_len=strlen(lines_starting_by);
 			break;
 		case CSV:
 			if (!fields_enclosed_by_ld){
@@ -258,6 +285,12 @@ void initialize_write(){
       }else
         statement_terminated_by=replace_escaped_strings(g_strdup(statement_terminated_by_ld));
       row_delimiter=g_strdup("");
+      // OPTIMIZATION: Cache delimiter lengths for hot path
+      row_delimiter_len=strlen(row_delimiter);
+      fields_terminated_by_len=strlen(fields_terminated_by);
+      lines_terminated_by_len=strlen(lines_terminated_by);
+      statement_terminated_by_len=strlen(statement_terminated_by);
+      lines_starting_by_len=strlen(lines_starting_by);
 			break;
 	}
 
@@ -286,7 +319,9 @@ gboolean is_hex_blob (MYSQL_FIELD field){
 
 GString *append_load_data_columns(GString *statement, MYSQL_FIELD *fields, guint num_fields){
   guint i = 0;
-  GString *str=g_string_new("SET ");
+  // OPTIMIZATION: Pre-allocate buffer for typical SET clauses
+  GString *str=g_string_sized_new(256);
+  g_string_append(str, "SET ");
   gboolean appendable=FALSE;
   for (i = 0; i < num_fields; ++i) {
     if (i > 0) {
@@ -493,18 +528,18 @@ void initialize_clickhouse_statement_suffix(struct db_table *dbt, MYSQL_FIELD * 
 }
 
 void initialize_load_data_header(struct db_table *dbt, MYSQL_FIELD *fields, guint num_fields){
-  dbt->load_data_header = g_string_sized_new(statement_size);
+  // OPTIMIZATION: Pre-allocate reasonable size for CSV headers (avg 20 chars per field)
+  dbt->load_data_header = g_string_sized_new(num_fields * 24);
   guint i = 0;
+  // OPTIMIZATION: Use single printf per field to reduce reallocation overhead
   for (i = 0; i < num_fields-1; ++i) {
-    g_string_append(dbt->load_data_header,fields_enclosed_by);
-    g_string_append(dbt->load_data_header,fields[i].name);
-    g_string_append(dbt->load_data_header,fields_enclosed_by);
-    g_string_append(dbt->load_data_header,fields_terminated_by);
+    g_string_append_printf(dbt->load_data_header, "%s%s%s%s",
+                           fields_enclosed_by, fields[i].name,
+                           fields_enclosed_by, fields_terminated_by);
   }
-  g_string_append(dbt->load_data_header,fields_enclosed_by);
-  g_string_append(dbt->load_data_header,fields[i].name);
-  g_string_append(dbt->load_data_header,fields_enclosed_by);
-  g_string_append(dbt->load_data_header,lines_terminated_by);
+  g_string_append_printf(dbt->load_data_header, "%s%s%s%s",
+                         fields_enclosed_by, fields[i].name,
+                         fields_enclosed_by, lines_terminated_by);
 }
 
 static
@@ -513,18 +548,21 @@ gboolean write_statement(int load_data_file, float *filessize, GString *statemen
     g_critical("Could not write out data for %s.%s", dbt->database->source_database, dbt->table);
     return FALSE;
   }
-  g_mutex_lock(max_statement_size_mutex);
-  if (statement->len > max_statement_size)
-    max_statement_size=statement->len;
-  g_mutex_unlock(max_statement_size_mutex);
+  // OPTIMIZATION: Lock-free max tracking using atomic compare-and-swap
+  // This eliminates mutex contention in the hot write path
+  guint64 current_max, new_len = statement->len;
+  do {
+    current_max = max_statement_size;
+    if (new_len <= current_max) break;  // Already have a larger max
+  } while (!__sync_bool_compare_and_swap(&max_statement_size, current_max, new_len));
   g_string_set_size(statement, 0);
   return TRUE;
 }
 
 void initialize_config_on_string(GString *output){
-  g_mutex_lock(max_statement_size_mutex);
-  g_string_append_printf(output,"[config]\nmax-statement-size = %ld\n", max_statement_size);
-  g_mutex_unlock(max_statement_size_mutex);
+  // OPTIMIZATION: No mutex needed - atomic read of volatile variable
+  guint64 current_max = max_statement_size;
+  g_string_append_printf(output,"[config]\nmax-statement-size = %"G_GUINT64_FORMAT"\n", current_max);
   g_string_append_printf(output, "num-sequences = %d\n", num_sequences);
 }
 
@@ -558,57 +596,69 @@ gboolean write_header(struct table_job * tj){
 
 void write_load_data_column_into_string( MYSQL *conn, gchar **column, MYSQL_FIELD field, gulong length, struct thread_data_buffers buffers){
     if (!*column) {
-      g_string_append(buffers.column, "\\N");
+      // OPTIMIZATION: Use g_string_append_len with known length for constant strings
+      g_string_append_len(buffers.column, "\\N", 2);
     } else if ( is_hex_blob(field) ) {
       g_string_set_size(buffers.escaped, length * 2 + 1);
-      mysql_hex_string(buffers.escaped->str,*column,length);
-      g_string_append(buffers.column,buffers.escaped->str);
+      // OPTIMIZATION: mysql_hex_string returns the length, use it for append_len
+      unsigned long hex_len = mysql_hex_string(buffers.escaped->str,*column,length);
+      g_string_append_len(buffers.column, buffers.escaped->str, hex_len);
     }else if (field.type != MYSQL_TYPE_LONG && field.type != MYSQL_TYPE_LONGLONG  && field.type != MYSQL_TYPE_INT24  && field.type != MYSQL_TYPE_SHORT ){
       g_string_append(buffers.column,fields_enclosed_by);
       // this will reserve the memory needed if the current size is not enough.
-      g_string_set_size(buffers.escaped, length * 2 + 1);
+      // OPTIMIZATION: Reserve extra space for escape expansion (worst case: each char doubled)
+      g_string_set_size(buffers.escaped, length * 4 + 1);
       unsigned long new_length = mysql_real_escape_string(conn, buffers.escaped->str, *column, length);
-      new_length++;
-      //g_string_set_size(escaped, new_length);
+      // OPTIMIZATION: Use the known length from mysql_real_escape_string
+      // instead of strlen() which was implicit in g_string_append
       m_replace_char_with_char('\\',*fields_escaped_by,buffers.escaped->str, new_length);
-      m_escape_char_with_char(*fields_terminated_by, *fields_escaped_by, buffers.escaped->str, new_length);
-      g_string_append(buffers.column,buffers.escaped->str);
+      // OPTIMIZATION: m_escape_char_with_char now returns new length, avoiding strlen()
+      new_length = m_escape_char_with_char(*fields_terminated_by, *fields_escaped_by, buffers.escaped->str, new_length);
+      g_string_append_len(buffers.column, buffers.escaped->str, new_length);
       g_string_append(buffers.column,fields_enclosed_by);
     }else
-      g_string_append(buffers.column, *column);
+      // OPTIMIZATION: Use g_string_append_len with known length for numeric fields
+      g_string_append_len(buffers.column, *column, length);
 }
 
 void write_sql_column_into_string( MYSQL *conn, gchar **column, MYSQL_FIELD field, gulong length, struct thread_data_buffers buffers){
     if (!*column) {
-      g_string_append(buffers.column, "NULL");
+      // OPTIMIZATION: Use g_string_append_len with known length
+      g_string_append_len(buffers.column, "NULL", 4);
     } else if (field.flags & NUM_FLAG) {
-      g_string_append(buffers.column, *column);
+      // OPTIMIZATION: Use g_string_append_len with known length for numeric fields
+      g_string_append_len(buffers.column, *column, length);
     } else if ( length == 0){
       g_string_append_c(buffers.column,*fields_enclosed_by);
       g_string_append_c(buffers.column,*fields_enclosed_by);
     } else if ( is_hex_blob(field) ) {
       g_string_set_size(buffers.escaped, length * 2 + 1);
-      g_string_append(buffers.column,"0x");
-      mysql_hex_string(buffers.escaped->str,*column,length);
-      g_string_append(buffers.column,buffers.escaped->str);
+      // OPTIMIZATION: Use g_string_append_len for "0x" prefix
+      g_string_append_len(buffers.column,"0x", 2);
+      // OPTIMIZATION: mysql_hex_string returns the length, use it
+      unsigned long hex_len = mysql_hex_string(buffers.escaped->str,*column,length);
+      g_string_append_len(buffers.column, buffers.escaped->str, hex_len);
     } else {
       /* We reuse buffers for string escaping, growing is expensive just at
  *        * the beginning */
       g_string_set_size(buffers.escaped, length * 2 + 1);
-      mysql_real_escape_string(conn, buffers.escaped->str, *column, length);
+      // OPTIMIZATION: Capture the return value which is the escaped length
+      unsigned long escaped_len = mysql_real_escape_string(conn, buffers.escaped->str, *column, length);
       if (field.type == MYSQL_TYPE_JSON)
-        g_string_append(buffers.column, "CONVERT(");
+        g_string_append_len(buffers.column, "CONVERT(", 8);
       g_string_append_c(buffers.column, *fields_enclosed_by);
-      g_string_append(buffers.column, buffers.escaped->str);
+      // OPTIMIZATION: Use g_string_append_len with known escaped length
+      g_string_append_len(buffers.column, buffers.escaped->str, escaped_len);
       g_string_append_c(buffers.column, *fields_enclosed_by);
       if (field.type == MYSQL_TYPE_JSON)
-        g_string_append(buffers.column, " USING UTF8MB4)");
+        g_string_append_len(buffers.column, " USING UTF8MB4)", 15);
     }
 }
 
 
 
-void write_column_into_string_with_terminated_by(MYSQL *conn, gchar * row, MYSQL_FIELD field, gulong length, struct thread_data_buffers buffers, void write_column_into_string(MYSQL *, gchar **, MYSQL_FIELD , gulong ,struct thread_data_buffers), struct function_pointer * f, gchar * terminated_by){
+// OPTIMIZATION: Pass terminated_by length to avoid strlen() in hot path
+void write_column_into_string_with_terminated_by(MYSQL *conn, gchar * row, MYSQL_FIELD field, gulong length, struct thread_data_buffers buffers, void write_column_into_string(MYSQL *, gchar **, MYSQL_FIELD , gulong ,struct thread_data_buffers), struct function_pointer * f, gchar * terminated_by, guint terminated_by_len){
   gchar *column=NULL;
   gulong rlength=length;
   g_string_set_size(buffers.column,0);
@@ -627,8 +677,11 @@ void write_column_into_string_with_terminated_by(MYSQL *conn, gchar * row, MYSQL
   }else{
     write_column_into_string( conn, &(column), field, rlength, buffers);
   }
-  g_string_append(buffers.row, buffers.column->str);
-  g_string_append(buffers.row, terminated_by);
+  // OPTIMIZATION: Use g_string_append_len with known length to avoid strlen()
+  // Called for every column of every row - extremely hot path
+  g_string_append_len(buffers.row, buffers.column->str, buffers.column->len);
+  // OPTIMIZATION: Use g_string_append_len with cached terminated_by length
+  g_string_append_len(buffers.row, terminated_by, terminated_by_len);
 
   if (column && column != row)
     g_free(column);
@@ -636,19 +689,53 @@ void write_column_into_string_with_terminated_by(MYSQL *conn, gchar * row, MYSQL
 
 void write_row_into_string(MYSQL *conn, struct db_table * dbt, MYSQL_ROW row, MYSQL_FIELD *fields, gulong *lengths, guint num_fields, struct thread_data_buffers buffers, void write_column_into_string(MYSQL *, gchar **, MYSQL_FIELD , gulong , struct thread_data_buffers)){
   guint i = 0;
-  g_string_append(buffers.row, lines_starting_by);
+  // OPTIMIZATION: Use g_string_append_len with cached length
+  g_string_append_len(buffers.row, lines_starting_by, lines_starting_by_len);
   struct function_pointer ** f = dbt->anonymized_function;
 
+  // OPTIMIZATION: Pass cached delimiter lengths to avoid strlen() per column
   for (i = 0; i < num_fields-1; i++) {
-    write_column_into_string_with_terminated_by(conn, row[i], fields[i], lengths[i], buffers, write_column_into_string,f==NULL?NULL:f[i], fields_terminated_by);
+    write_column_into_string_with_terminated_by(conn, row[i], fields[i], lengths[i], buffers, write_column_into_string,f==NULL?NULL:f[i], fields_terminated_by, fields_terminated_by_len);
   }
-  write_column_into_string_with_terminated_by(conn, row[i], fields[i], lengths[i], buffers, write_column_into_string,f==NULL?NULL:f[i], lines_terminated_by);
+  write_column_into_string_with_terminated_by(conn, row[i], fields[i], lengths[i], buffers, write_column_into_string,f==NULL?NULL:f[i], lines_terminated_by, lines_terminated_by_len);
 }
 
+// OPTIMIZATION: Atomic row counter - eliminates mutex lock/unlock overhead
+// Uses __sync_fetch_and_add which is lock-free on x86_64 and ARM64
+// For guint64, this compiles to LOCK XADD on x86_64 or LDXR/STXR on ARM64
 void update_dbt_rows(struct db_table * dbt, guint64 num_rows){
-  g_mutex_lock(dbt->rows_lock);
-  dbt->rows+=num_rows;
-  g_mutex_unlock(dbt->rows_lock);
+  __sync_fetch_and_add(&dbt->rows, num_rows);
+}
+
+// OPTIMIZATION: Thread-local batched row counter update
+// Accumulates rows in thread-local storage and flushes periodically
+// This reduces atomic operations from millions to thousands
+void update_dbt_rows_batched(struct thread_data *td, struct db_table *dbt, guint64 num_rows){
+  // If switching tables, flush previous table's count first
+  if (td->local_row_count_dbt != NULL && td->local_row_count_dbt != dbt) {
+    if (td->local_row_count > 0) {
+      __sync_fetch_and_add(&td->local_row_count_dbt->rows, td->local_row_count);
+      td->local_row_count = 0;
+    }
+  }
+
+  td->local_row_count_dbt = dbt;
+  td->local_row_count += num_rows;
+
+  // Flush to shared counter when threshold reached
+  if (td->local_row_count >= ROW_BATCH_FLUSH_THRESHOLD) {
+    __sync_fetch_and_add(&dbt->rows, td->local_row_count);
+    td->local_row_count = 0;
+  }
+}
+
+// Flush any remaining thread-local row count (call at end of table processing)
+void flush_dbt_rows(struct thread_data *td){
+  if (td->local_row_count_dbt != NULL && td->local_row_count > 0) {
+    __sync_fetch_and_add(&td->local_row_count_dbt->rows, td->local_row_count);
+    td->local_row_count = 0;
+    td->local_row_count_dbt = NULL;
+  }
 }
 
 void close_file(struct table_job * tj, struct table_job_file *tjf){
@@ -747,7 +834,8 @@ void write_result_into_file(MYSQL *conn, MYSQL_RES *result, struct table_job * t
         initialize_sql_statement(tj->td->thread_data_buffers.statement);
 				write_clickhouse_statement(tj);
 			}
-      g_string_append(tj->td->thread_data_buffers.statement, dbt->insert_statement->str);
+      // OPTIMIZATION: Use append_len with known insert_statement length
+      g_string_append_len(tj->td->thread_data_buffers.statement, dbt->insert_statement->str, dbt->insert_statement->len);
       break;
 		case SQL_INSERT:
       if (tj->rows->file < 0){
@@ -761,15 +849,18 @@ void write_result_into_file(MYSQL *conn, MYSQL_RES *result, struct table_job * t
       }
 	  	if (!tj->st_in_file)
   	  	initialize_sql_statement(tj->td->thread_data_buffers.statement);
-  		g_string_append(tj->td->thread_data_buffers.statement, dbt->insert_statement->str);
+      // OPTIMIZATION: Use append_len with known insert_statement length
+  		g_string_append_len(tj->td->thread_data_buffers.statement, dbt->insert_statement->str, dbt->insert_statement->len);
 	  	break;
 	}
 
   message_dumping_data(tj);
 
-  GDateTime *from = g_date_time_new_now_local();
-  GDateTime *to = NULL;
-  GTimeSpan diff=0;
+  // OPTIMIZATION: Use g_get_monotonic_time() instead of GDateTime
+  // g_get_monotonic_time() is O(1) with no allocations, vs GDateTime which allocates
+  // Called every row iteration, so millions of times during large dumps
+  gint64 last_progress_time = g_get_monotonic_time();
+  gint64 current_time = 0;
 	while ((row = mysql_fetch_row(result))) {
 // Uncomment next line if you need to simulate a slow read which is useful when calculate the chunk size
 //    g_usleep(1);
@@ -781,34 +872,35 @@ void write_result_into_file(MYSQL *conn, MYSQL_RES *result, struct table_job * t
     // if row exceeded statement_size then FLUSH buffer to disk
 		if (tj->td->thread_data_buffers.statement->len + tj->td->thread_data_buffers.row->len + 1 > statement_size){
       if (num_rows_st == 0) {
-        g_string_append(tj->td->thread_data_buffers.statement, tj->td->thread_data_buffers.row->str);
+        // OPTIMIZATION: Use append_len with known length
+        g_string_append_len(tj->td->thread_data_buffers.statement, tj->td->thread_data_buffers.row->str, tj->td->thread_data_buffers.row->len);
         g_string_set_size(tj->td->thread_data_buffers.row, 0);
         g_warning("Row bigger than statement_size for %s.%s", dbt->database->source_database,
                 dbt->table);
       }
-      g_string_append(tj->td->thread_data_buffers.statement, statement_terminated_by);
+      // OPTIMIZATION: Use append_len with cached length
+      g_string_append_len(tj->td->thread_data_buffers.statement, statement_terminated_by, statement_terminated_by_len);
       if (!write_statement(tj->rows->file, &(tj->filesize), tj->td->thread_data_buffers.statement, dbt)) {
         g_critical("Fail to write on %s", tj->rows->filename);
         return;
       }
-			update_dbt_rows(dbt, num_rows);
+      // OPTIMIZATION: Use batched row counter to reduce atomic ops
+			update_dbt_rows_batched(tj->td, dbt, num_rows);
       tj->num_rows_of_last_run+=num_rows;
 			num_rows=0;
 			num_rows_st=0;
 			tj->st_in_file++;
     // initilize buffer if needed (INSERT INTO)
       if (output_format == SQL_INSERT || output_format == CLICKHOUSE){
-				g_string_append(tj->td->thread_data_buffers.statement, dbt->insert_statement->str);
+        // OPTIMIZATION: Use append_len with known insert_statement length
+				g_string_append_len(tj->td->thread_data_buffers.statement, dbt->insert_statement->str, dbt->insert_statement->len);
 			}
-      to = g_date_time_new_now_local();
-      diff=g_date_time_difference(to,from)/G_TIME_SPAN_SECOND;
-      if (diff > 4){
-        g_date_time_unref(from);
-        from=to;
-        to=NULL;
+      // OPTIMIZATION: Use monotonic time - no allocations, O(1) operation
+      // 4 seconds = 4,000,000 microseconds
+      current_time = g_get_monotonic_time();
+      if (current_time - last_progress_time > 4000000){
+        last_progress_time = current_time;
         message_dumping_data(tj);
-      }else{
-        g_date_time_unref(to);
       }
 
 			check_pause_resume(tj->td);
@@ -823,32 +915,37 @@ void write_result_into_file(MYSQL *conn, MYSQL_RES *result, struct table_job * t
       reopen_files(tj);
 			if (output_format == SQL_INSERT){
         initialize_sql_statement(tj->td->thread_data_buffers.statement);
-        g_string_append(tj->td->thread_data_buffers.statement, dbt->insert_statement->str);
+        // OPTIMIZATION: Use append_len with known insert_statement length
+        g_string_append_len(tj->td->thread_data_buffers.statement, dbt->insert_statement->str, dbt->insert_statement->len);
       }
       tj->st_in_file = 0;
-      tj->filesize = 0;			
+      tj->filesize = 0;
 		}
 		//
 		// write row to buffer
+    // OPTIMIZATION: Use g_string_append_len with cached lengths in hot loop
+    // This eliminates strlen() calls that were O(n) per row
     if (num_rows_st && (output_format == SQL_INSERT || output_format == CLICKHOUSE))
-      g_string_append(tj->td->thread_data_buffers.statement, row_delimiter);
-    g_string_append(tj->td->thread_data_buffers.statement, tj->td->thread_data_buffers.row->str);
+      g_string_append_len(tj->td->thread_data_buffers.statement, row_delimiter, row_delimiter_len);
+    g_string_append_len(tj->td->thread_data_buffers.statement, tj->td->thread_data_buffers.row->str, tj->td->thread_data_buffers.row->len);
 		if (tj->td->thread_data_buffers.row->len>0)
       num_rows_st++;
     g_string_set_size(tj->td->thread_data_buffers.row, 0);
   }
-  update_dbt_rows(dbt, num_rows);
+  // OPTIMIZATION: Use batched row counter and flush at end of result processing
+  update_dbt_rows_batched(tj->td, dbt, num_rows);
+  flush_dbt_rows(tj->td);  // Flush remaining count at end of table chunk
   tj->num_rows_of_last_run+=num_rows;
   if (num_rows_st > 0 && tj->td->thread_data_buffers.statement->len > 0){
     if (output_format == SQL_INSERT || output_format == CLICKHOUSE)
-			g_string_append(tj->td->thread_data_buffers.statement, statement_terminated_by);
+			g_string_append_len(tj->td->thread_data_buffers.statement, statement_terminated_by, statement_terminated_by_len);
     if (!write_statement(tj->rows->file, &(tj->filesize), tj->td->thread_data_buffers.statement, dbt)) {
       g_critical("Fail to write on %s", tj->rows->filename);
       return;
     }
 		tj->st_in_file++;
   }
-  g_date_time_unref(from);
+  // NOTE: No g_date_time_unref needed - we use monotonic time now (no allocation)
 
 //  g_string_free(statement, TRUE);
 //  g_string_free(escaped, TRUE);

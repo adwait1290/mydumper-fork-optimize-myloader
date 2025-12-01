@@ -37,12 +37,18 @@
 #include "myloader_table.h"
 GHashTable *tbl_hash=NULL;
 int (*m_close)(void *file) = NULL;
-guint refresh_table_list_interval=100;
+// OPTIMIZATION: Increased refresh interval to reduce list rebuild frequency
+// Original value was 100, which causes excessive rebuilding with many tables
+// For 250K tables: 5000 interval = refresh every 5000 operations instead of 100
+guint refresh_table_list_interval=5000;
 guint refresh_table_list_counter=1;
 gboolean skip_table_sorting = FALSE;
-gchar ** zstd_decompress_cmd = NULL; 
+gchar ** zstd_decompress_cmd = NULL;
 gchar ** gzip_decompress_cmd = NULL;
-guint max_number_tables_to_sort_in_table_list = 100000;
+// OPTIMIZATION: Reduced sorting threshold - sorting 100k tables is expensive
+// For large restores, skip sorting entirely as it's O(n log n) on every refresh
+// 5000 tables is the threshold - beyond this, sorting is skipped
+guint max_number_tables_to_sort_in_table_list = 5000;
 
 void initialize_common(){
   refresh_table_list_counter=refresh_table_list_interval;
@@ -421,43 +427,79 @@ void get_database_table_from_file(const gchar *filename,const char *sufix,gchar 
 }
 
 void refresh_table_list_without_table_hash_lock(struct configuration *conf, gboolean force){
-  trace("refresh_table_list requested");
+  // OPTIMIZATION: Early exit if not forced and counter hasn't expired
+  // This avoids the atomic operation overhead in the common case
+  if (!force) {
+    gint current = g_atomic_int_get(&refresh_table_list_counter);
+    if (current > 1) {
+      g_atomic_int_dec_and_test(&refresh_table_list_counter);
+      return;
+    }
+  }
+
   if (force || g_atomic_int_dec_and_test(&refresh_table_list_counter)){
-    trace("refresh_table_list granted");
+    g_debug("[TABLE_LIST] Refreshing table list (force=%d)", force);
     GList * table_list=NULL;
     GList * loading_table_list=NULL;
     GHashTableIter iter;
     gchar * lkey;
     g_mutex_lock(conf->table_list_mutex);
+
+    guint table_count = g_hash_table_size(conf->table_hash);
+    // OPTIMIZATION: For very large table counts, skip sorting entirely
+    // Sorting 6000+ tables every refresh is extremely expensive
+    gboolean _skip_table_sorting = skip_table_sorting ||
+                                   table_count > max_number_tables_to_sort_in_table_list;
+
+    if (table_count > 1000) {
+      g_debug("[TABLE_LIST] Large table count (%u), skip_sorting=%d", table_count, _skip_table_sorting);
+    }
+
     g_hash_table_iter_init ( &iter, conf->table_hash );
     struct db_table *dbt=NULL;
-    gboolean _skip_table_sorting= skip_table_sorting || g_hash_table_size(conf->table_hash) > max_number_tables_to_sort_in_table_list;
+
+    // OPTIMIZATION: Pre-allocate space hint for loading list
+    // This reduces memory fragmentation for large restores
+    guint loading_count = 0;
+
     while ( g_hash_table_iter_next ( &iter, (gpointer *) &lkey, (gpointer *) &dbt ) ) {
-//      if (skip_table_sorting || g_list_length(table_list) > max_number_tables_to_sort_in_table_list)
-      trace("table_list inserting: %s", lkey);
-      if (_skip_table_sorting){
-        table_list=g_list_prepend(table_list,dbt);
-        table_lock(dbt);
-        if (dbt->schema_state < DATA_DONE)
+      // Always prepend to full table_list (no sorting needed for this one)
+      table_list=g_list_prepend(table_list,dbt);
+
+      // Only add to loading_table_list if still needs loading
+      table_lock(dbt);
+      enum schema_status state = dbt->schema_state;
+      table_unlock(dbt);
+
+      if (state < DATA_DONE) {
+        if (_skip_table_sorting){
           loading_table_list=g_list_prepend(loading_table_list,dbt);
-        table_unlock(dbt);
-      }else{
-//        table_list=g_list_insert_sorted(table_list,dbt,&compare_dbt_short);
-        table_list=g_list_prepend(table_list,dbt);
-        table_lock(dbt);
-        if (dbt->schema_state < DATA_DONE)
+        }else{
           loading_table_list=g_list_insert_sorted(loading_table_list,dbt,&compare_dbt_short);
-        table_unlock(dbt);
+        }
+        loading_count++;
       }
     }
+
     g_list_free(conf->table_list);
     conf->table_list=table_list;
     g_list_free(conf->loading_table_list);
     conf->loading_table_list=loading_table_list;
-    g_atomic_int_set(&refresh_table_list_counter,refresh_table_list_interval);
+
+    // OPTIMIZATION: Dynamically adjust refresh interval based on table count
+    // More tables = less frequent refreshes to reduce overhead
+    guint new_interval = refresh_table_list_interval;
+    if (table_count > 5000) {
+      new_interval = refresh_table_list_interval * 5;  // 2500 for default
+    } else if (table_count > 1000) {
+      new_interval = refresh_table_list_interval * 2;  // 1000 for default
+    }
+    g_atomic_int_set(&refresh_table_list_counter, new_interval);
+
+    g_debug("[TABLE_LIST] Refresh complete: total=%u, loading=%u, next_refresh_in=%u",
+            table_count, loading_count, new_interval);
+
     g_mutex_unlock(conf->table_list_mutex);
-  }else{
-    trace("refresh_table_list denied");
   }
 }
 

@@ -143,6 +143,7 @@ extern guint trx_tables;
 extern gboolean replica_stopped;
 extern guint isms;
 
-extern guint64 max_statement_size;
+// OPTIMIZATION: volatile for atomic CAS operations (no mutex needed)
+extern volatile guint64 max_statement_size;
 extern gchar *set_names_in_conn_for_sct, *set_names_in_file_for_sct, *set_names_in_file_by_default;
 extern guint num_sequences;

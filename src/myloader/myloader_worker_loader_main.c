@@ -37,8 +37,55 @@ static GThread *_worker_loader_main = NULL;
 guint threads_waiting = 0;
 static GMutex *threads_waiting_mutex= NULL;
 
+// OPTIMIZATION: Track statistics for performance monitoring
+static guint64 jobs_dispatched = 0;
+static guint64 dispatch_iterations = 0;
+static guint64 queue_hits = 0;
+static guint64 queue_misses = 0;
 
 void *worker_loader_main_thread(struct configuration *conf);
+
+// OPTIMIZATION: Ready table queue functions for O(1) dispatch
+// Add a table to the ready queue if it meets all criteria:
+// - schema_state == CREATED
+// - job_count > 0
+// - current_threads < max_threads
+// - not already in queue
+// CALLER MUST HOLD dbt->mutex (table lock)
+void enqueue_table_if_ready_locked(struct configuration *conf, struct db_table *dbt) {
+  // Safety check: queue may not exist in --no-data mode
+  // (loader threads skipped, but schema workers still call this)
+  if (conf->ready_table_queue == NULL) {
+    return;
+  }
+
+  // Check all readiness conditions
+  if (dbt->schema_state == CREATED &&
+      dbt->job_count > 0 &&
+      dbt->current_threads < dbt->max_threads &&
+      !dbt->in_ready_queue &&
+      !dbt->object_to_export.no_data &&
+      !dbt->is_view &&
+      !dbt->is_sequence) {
+    dbt->in_ready_queue = TRUE;
+    g_async_queue_push(conf->ready_table_queue, dbt);
+    trace("[READY_QUEUE] Enqueued %s.%s (jobs=%u, threads=%u/%u)",
+          dbt->database->target_database, dbt->source_table_name,
+          dbt->job_count, dbt->current_threads, dbt->max_threads);
+
+    // FIX: Wake waiting data threads when we have work available
+    // Without this, threads could be waiting in threads_waiting while
+    // ready_table_queue has work, causing the dispatch loop to stall
+    wake_data_threads();
+  }
+}
+
+// Version that acquires the lock itself
+void enqueue_table_if_ready(struct configuration *conf, struct db_table *dbt) {
+  table_lock(dbt);
+  enqueue_table_if_ready_locked(conf, dbt);
+  table_unlock(dbt);
+}
 
 void initialize_worker_loader_main (struct configuration *conf){
   data_control_queue = g_async_queue_new();
@@ -56,108 +103,180 @@ void wait_worker_loader_main()
 }
 
 void data_control_queue_push(enum data_control_type current_ft){
+  // Safety check: queue may not exist in --no-data mode
+  // (loader threads skipped, but schema workers still call this on completion)
+  if (data_control_queue == NULL) {
+    trace("data_control_queue is NULL (--no-data mode), skipping push of %s", data_control_type2str(current_ft));
+    return;
+  }
   trace("data_control_queue <- %s", data_control_type2str(current_ft));
   g_async_queue_push(data_control_queue, GINT_TO_POINTER(current_ft));
 }
 
 gboolean give_me_next_data_job_conf(struct configuration *conf, struct restore_job ** rj){
-  gboolean giveup = TRUE;
-  g_mutex_lock(conf->table_list_mutex);
-  GList * iter=conf->loading_table_list;
   struct restore_job *job = NULL;
-//  g_mutex_lock(conf->table_list_mutex);
-//  trace("Elements in table_list: %d",g_list_length(conf->table_list));
-//  g_mutex_unlock(conf->table_list_mutex);
-//  We are going to check every table and see if there is any missing job
-  struct db_table * dbt;
-  while (iter != NULL){
-    dbt = iter->data;
-    trace("DB: %s Table: %s Schema State: %d remaining_jobs: %d", dbt->database->target_database,dbt->source_table_name, dbt->schema_state, dbt->remaining_jobs);
-    if (dbt->database->schema_state == NOT_FOUND){
-      iter=iter->next;
-      /*
-        TODO: make all "voting for finish" messages another debug level
+  struct db_table *dbt = NULL;
+  gboolean giveup = TRUE;
 
-        G_MESSAGES_DEBUG.  A space-separated list of log domains for which informational
-        and debug messages should be printed. By default, these messages are not
-        printed. You can also use the special value all. This environment variable only
-        affects the default log handler, g_log_default_handler().
-      */
-      trace("%s.%s: %s, voting for finish", dbt->database->target_database, dbt->source_table_name, status2str(dbt->schema_state));
-      continue;
-    }
+  // OPTIMIZATION: Track dispatch iterations for monitoring
+  dispatch_iterations++;
+
+  // OPTIMIZATION: Try ready_table_queue first for O(1) dispatch
+  // The queue contains tables that were previously determined to be ready
+  while ((dbt = g_async_queue_try_pop(conf->ready_table_queue)) != NULL) {
     table_lock(dbt);
-    if (dbt->schema_state >= DATA_DONE ||
-        (dbt->schema_state == CREATED && (dbt->is_view || dbt->is_sequence))){
-      trace("%s.%s done: %s, voting for finish", dbt->database->target_database, dbt->source_table_name, status2str(dbt->schema_state));
-      iter=iter->next;
-      table_unlock(dbt);
-      continue;
-    }
-    // I could do some job in here, do we have some for me?
-    if (!resume && dbt->schema_state<CREATED ){
-      giveup=FALSE;
-      trace("%s.%s not yet created: %s, waiting", dbt->database->target_database, dbt->source_table_name, status2str(dbt->schema_state));
-      iter=iter->next;
+    dbt->in_ready_queue = FALSE;  // Mark as removed from queue
+
+    // Re-validate readiness conditions (may have changed since enqueue)
+    if (dbt->schema_state != CREATED ||
+        dbt->job_count == 0 ||
+        dbt->current_threads >= dbt->max_threads ||
+        dbt->object_to_export.no_data ||
+        dbt->is_view ||
+        dbt->is_sequence) {
+      // Table no longer ready - skip it
+      queue_misses++;
+
+      // Handle special cases
+      if (dbt->schema_state == CREATED && dbt->job_count == 0 &&
+          dbt->current_threads == 0 && all_jobs_are_enqueued &&
+          g_atomic_int_get(&(dbt->remaining_jobs)) == 0) {
+        dbt->schema_state = DATA_DONE;
+        enqueue_index_for_dbt_if_possible(conf, dbt);
+        trace("[READY_QUEUE] %s.%s -> DATA_DONE (no more jobs)",
+              dbt->database->target_database, dbt->source_table_name);
+      }
+
       table_unlock(dbt);
       continue;
     }
 
-      // TODO: can we do without double check (not under and under dbt->mutex)?
-    if (dbt->schema_state >= DATA_DONE ||
-        (dbt->schema_state == CREATED && (dbt->is_view || dbt->is_sequence))){
-      trace("%s.%s done just now: %s, voting for finish", dbt->database->target_database, dbt->source_table_name, status2str(dbt->schema_state));
-      iter=iter->next;
-      table_unlock(dbt);
+    // Table is ready - dispatch a job!
+    queue_hits++;
+    job = dbt->restore_job_list->data;
+    dbt->restore_job_list = g_list_delete_link(dbt->restore_job_list, dbt->restore_job_list);
+    dbt->job_count--;
+    dbt->current_threads++;
+    jobs_dispatched++;
+
+    g_debug("[LOADER_MAIN] DISPATCH #%"G_GUINT64_FORMAT" (queue): %s.%s threads=%u/%u jobs_left=%u",
+            jobs_dispatched, dbt->database->target_database, dbt->source_table_name,
+            dbt->current_threads, dbt->max_threads, dbt->job_count);
+
+    // Re-enqueue if still has more jobs and room for threads
+    enqueue_table_if_ready_locked(conf, dbt);
+
+    table_unlock(dbt);
+    giveup = FALSE;
+    *rj = job;
+
+    // Log queue statistics periodically
+    if (dispatch_iterations % 1000 == 0) {
+      g_debug("[LOADER_MAIN] Queue stats: iterations=%"G_GUINT64_FORMAT" dispatched=%"G_GUINT64_FORMAT" hits=%"G_GUINT64_FORMAT" misses=%"G_GUINT64_FORMAT,
+              dispatch_iterations, jobs_dispatched, queue_hits, queue_misses);
+    }
+    return giveup;
+  }
+
+  // FALLBACK: Queue was empty, scan the table list
+  // This handles tables that weren't yet added to the queue
+  g_mutex_lock(conf->table_list_mutex);
+  GList *iter = conf->loading_table_list;
+  guint tables_checked = 0;
+  guint tables_not_ready = 0;
+  guint tables_at_max_threads = 0;
+
+  while (iter != NULL) {
+    dbt = iter->data;
+    tables_checked++;
+
+    // Quick pre-check for database state (safe without lock)
+    if (dbt->database->schema_state == NOT_FOUND) {
+      iter = iter->next;
       continue;
     }
 
-    if (dbt->schema_state == CREATED && g_list_length(dbt->restore_job_list) > 0){
-      if (dbt->object_to_export.no_data){
-        GList * current = dbt->restore_job_list;
-        while (current){
+    table_lock(dbt);
+    enum schema_status current_state = dbt->schema_state;
+
+    // Skip if table processing is complete
+    if (current_state >= DATA_DONE ||
+        (current_state == CREATED && (dbt->is_view || dbt->is_sequence))) {
+      table_unlock(dbt);
+      iter = iter->next;
+      continue;
+    }
+
+    // Skip if not CREATED
+    if (current_state != CREATED) {
+      giveup = FALSE;
+      tables_not_ready++;
+      table_unlock(dbt);
+      iter = iter->next;
+      continue;
+    }
+
+    // At this point, schema_state == CREATED
+    if (dbt->job_count > 0) {
+      if (dbt->object_to_export.no_data) {
+        GList *current = dbt->restore_job_list;
+        while (current) {
           g_free(((struct restore_job *)current->data)->data.drj);
-          current=current->next;
+          current = current->next;
         }
         dbt->schema_state = ALL_DONE;
-        trace("Setting on %s.%s ALL_DONE", dbt->database->target_database, dbt->source_table_name);
-
-      }else{
-        if (dbt->current_threads >= dbt->max_threads ){
-          giveup=FALSE;
-          trace("%s.%s Reached max thread %s", dbt->database->target_database, dbt->source_table_name, status2str(dbt->schema_state));
-          iter=iter->next;
-          table_unlock(dbt);
-          continue;
-        }
-        // We found a job that we can process!
-        job = dbt->restore_job_list->data;
-        GList * current = dbt->restore_job_list;
-//      dbt->restore_job_list = dbt->restore_job_list->next;
-        dbt->restore_job_list = g_list_remove_link(dbt->restore_job_list, current);
-        g_list_free_1(current);
-        dbt->current_threads++;
+        g_atomic_int_inc(&(conf->tables_all_done));
+        g_debug("[LOADER_MAIN] %s.%s -> ALL_DONE (no_data flag)",
+                dbt->database->target_database, dbt->source_table_name);
+      } else if (dbt->current_threads >= dbt->max_threads) {
+        giveup = FALSE;
+        tables_at_max_threads++;
+        // Don't enqueue - will be re-enqueued when a thread finishes
         table_unlock(dbt);
-        giveup=FALSE;
-        trace("%s.%s sending %s: %s, threads: %u, prohibiting finish", dbt->database->target_database, dbt->source_table_name,
-            rjtype2str(job->type), job->filename, dbt->current_threads);
+        iter = iter->next;
+        continue;
+      } else {
+        // Dispatch a job
+        job = dbt->restore_job_list->data;
+        dbt->restore_job_list = g_list_delete_link(dbt->restore_job_list, dbt->restore_job_list);
+        dbt->job_count--;
+        dbt->current_threads++;
+        jobs_dispatched++;
+
+        g_debug("[LOADER_MAIN] DISPATCH #%"G_GUINT64_FORMAT" (scan): %s.%s threads=%u/%u",
+                jobs_dispatched, dbt->database->target_database, dbt->source_table_name,
+                dbt->current_threads, dbt->max_threads);
+
+        // Enqueue for future O(1) dispatch if still has jobs
+        enqueue_table_if_ready_locked(conf, dbt);
+
+        table_unlock(dbt);
+        giveup = FALSE;
         break;
       }
-    }else{
-// AND CURRENT THREADS IS 0... if not we are seting DATA_DONE to unfinished tables
-      trace("No remaining jobs on %s.%s and %d %d %d", dbt->database->target_database, dbt->source_table_name, all_jobs_are_enqueued, dbt->current_threads, dbt->remaining_jobs); 
-      if (all_jobs_are_enqueued && dbt->current_threads == 0 && (g_atomic_int_get(&(dbt->remaining_jobs))==0 )){
+    } else {
+      // No jobs for this table
+      trace("No remaining jobs on %s.%s", dbt->database->target_database, dbt->source_table_name);
+      if (all_jobs_are_enqueued && dbt->current_threads == 0 &&
+          g_atomic_int_get(&(dbt->remaining_jobs)) == 0) {
         dbt->schema_state = DATA_DONE;
-        enqueue_index_for_dbt_if_possible(conf,dbt);
-        trace("%s.%s queuing indexes, voting for finish", dbt->database->target_database, dbt->source_table_name);
-      }else
-        giveup=FALSE;
+        enqueue_index_for_dbt_if_possible(conf, dbt);
+        trace("%s.%s queuing indexes", dbt->database->target_database, dbt->source_table_name);
+      } else {
+        giveup = FALSE;
+      }
     }
-    
+
     table_unlock(dbt);
-    iter=iter->next;
+    iter = iter->next;
   }
-  trace("No more tables to check %d", giveup);
+
+  // Log dispatch statistics periodically
+  if (dispatch_iterations % 1000 == 0 && dispatch_iterations > 0) {
+    g_debug("[LOADER_MAIN] Dispatch stats: iterations=%"G_GUINT64_FORMAT" jobs=%"G_GUINT64_FORMAT" checked=%u not_ready=%u at_max=%u hits=%"G_GUINT64_FORMAT" misses=%"G_GUINT64_FORMAT,
+            dispatch_iterations, jobs_dispatched, tables_checked, tables_not_ready, tables_at_max_threads, queue_hits, queue_misses);
+  }
+
   g_mutex_unlock(conf->table_list_mutex);
   *rj = job;
   return giveup;
@@ -165,6 +284,10 @@ gboolean give_me_next_data_job_conf(struct configuration *conf, struct restore_j
 
 static
 void wake_threads_waiting(){
+  // Safety check: mutex may not exist in --no-data mode
+  if (threads_waiting_mutex == NULL) {
+    return;
+  }
   g_mutex_lock(threads_waiting_mutex);
   while(threads_waiting>0){
     trace("Waking up threads");
@@ -175,10 +298,14 @@ void wake_threads_waiting(){
 }
 
 void wake_data_threads(){
+  // Safety check: mutex may not exist in --no-data mode
+  if (threads_waiting_mutex == NULL) {
+    return;
+  }
   g_mutex_lock(threads_waiting_mutex);
   if (threads_waiting>0){
     data_control_queue_push(WAKE_DATA_THREAD);
-  }else 
+  }else
     trace("No threads sleeping");
   g_mutex_unlock(threads_waiting_mutex);
 }
@@ -232,6 +359,8 @@ void *worker_loader_main_thread(struct configuration *conf){
       }
       break;
     case FILE_TYPE_ENDED:
+      // FIX: Force table list refresh to capture ALL tables
+      refresh_table_list(conf);
       enqueue_indexes_if_possible(conf);
       all_jobs_are_enqueued = TRUE;
 //      data_ended();

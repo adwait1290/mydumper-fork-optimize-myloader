@@ -56,6 +56,8 @@
 #define BINARY_CHARSET "binary"
 #define AUTO_CHARSET "auto"
 extern GList *ignore_errors_list;
+// OPTIMIZATION: Hash set for O(1) lookup - use ignore_error_code() function
+extern GHashTable *ignore_errors_set;
 extern const gchar *start_replica;
 extern const gchar *stop_replica;
 extern const gchar *start_replica_sql_thread;
@@ -71,6 +73,9 @@ extern guint throttle_max_usleep_limit;
 #define _src_common_h
 void initialize_zstd_cmd();
 void initialize_gzip_cmd();
+
+// OPTIMIZATION: O(1) error code lookup - returns TRUE if error should be ignored
+gboolean should_ignore_error_code(guint error_code);
 
 struct object_to_export{
   gboolean no_data;

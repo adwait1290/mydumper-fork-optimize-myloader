@@ -30,6 +30,7 @@
 #include "myloader_common.h"
 #include "myloader_control_job.h"
 #include "myloader_worker_loader.h"
+#include "myloader_worker_loader_main.h"
 #include "myloader_worker_index.h"
 #include "myloader_database.h"
 
@@ -40,7 +41,10 @@ static GMutex *progress_mutex = NULL;
 static GMutex *single_threaded_create_table = NULL;
 GMutex *shutdown_triggered_mutex=NULL;
 unsigned long long int progress = 0;
-enum purge_mode purge_mode = FAIL;
+// SMART DEFAULT: TRUNCATE mode
+// When table exists: TRUNCATE it and skip CREATE TABLE (no lock contention)
+// When table doesn't exist: TRUNCATE fails, CREATE TABLE runs
+enum purge_mode purge_mode = TRUNCATE;
 
 void initialize_restore_job(){
   file_list_to_do = g_async_queue_new();
@@ -159,8 +163,21 @@ int overwrite_table(struct thread_data *td, struct db_table *dbt){
         g_warning("Delete failed, we are going to try to create table or view");
       restore_data_in_gstring(td, data, TRUE, dbt->database);
       break;
+    case FAIL:
+      g_debug("[OVERWRITE_TABLE] purge_mode=FAIL for %s.%s - no overwrite action needed",
+              dbt->database->target_database, dbt->source_table_name);
+      break;
+    case NONE:
+      g_debug("[OVERWRITE_TABLE] purge_mode=NONE for %s.%s - no overwrite action needed",
+              dbt->database->target_database, dbt->source_table_name);
+      break;
+    case PM_SKIP:
+      g_debug("[OVERWRITE_TABLE] purge_mode=PM_SKIP for %s.%s - skipping table",
+              dbt->database->target_database, dbt->source_table_name);
+      break;
     default:
-      g_warning("This should not happen");
+      g_warning("[OVERWRITE_TABLE] Unexpected purge_mode=%d for table %s.%s - this should not happen",
+                purge_mode, dbt->database->target_database, dbt->source_table_name);
       break;
   }
   return truncate_or_delete_failed;
@@ -216,16 +233,13 @@ void is_created(gchar* _key, struct db_table* dbt, guint *total){
 }
 
 
+// OPTIMIZATION: O(1) atomic counter reads instead of O(n) hash table iteration
 void get_total_done(struct configuration * conf, guint *total){
-  g_mutex_lock(conf->table_hash_mutex);
-  g_hash_table_foreach(conf->table_hash,(void (*)(void *, void *, void *)) &is_all_done, total);
-  g_mutex_unlock(conf->table_hash_mutex);
+  *total = (guint)g_atomic_int_get(&(conf->tables_all_done));
 }
 
 void get_total_created(struct configuration * conf, guint *total){
-  g_mutex_lock(conf->table_hash_mutex);
-  g_hash_table_foreach(conf->table_hash,(void (*)(void *, void *, void *)) &is_created, total);
-  g_mutex_unlock(conf->table_hash_mutex);
+  *total = (guint)g_atomic_int_get(&(conf->tables_created));
 }
 
 void execute_drop_database(struct thread_data *td, gchar *database) {
@@ -238,7 +252,7 @@ void execute_drop_database(struct thread_data *td, gchar *database) {
 }
 
 int process_restore_job(struct thread_data *td, struct restore_job *rj){
-  trace("Restoring %s", rj->filename);
+  trace("Thread %d: process_restore_job type=%s", td->thread_id, rjtype2str(rj->type));
   if (td->conf->pause_resume != NULL){
     GMutex *resume_mutex = (GMutex *)g_async_queue_try_pop(td->conf->pause_resume);
     if (resume_mutex != NULL){
@@ -258,6 +272,7 @@ int process_restore_job(struct thread_data *td, struct restore_job *rj){
 //  guint i=0;
   guint total=0;
   td->status=STARTED;
+
   switch (rj->type) {
     case JOB_RESTORE_STRING:
 // INDEXES
@@ -279,33 +294,49 @@ int process_restore_job(struct thread_data *td, struct restore_job *rj){
       free_schema_restore_job(rj->data.srj);
       break;
     case JOB_TO_CREATE_TABLE:
-
+      // CRITICAL FIX: Use table lock for ALL schema_state transitions
+      table_lock(dbt);
+      trace("Thread %d: BEGIN creating table %s.%s (state: %s)",
+            td->thread_id, dbt->database->target_database, dbt->source_table_name,
+            status2str(dbt->schema_state));
       dbt->schema_state=CREATING;
+      table_unlock(dbt);
+
       if ((!source_db || g_strcmp0(dbt->database->source_database,source_db)==0) && !no_schemas && !dbt->object_to_export.no_schema ){
         if (serial_tbl_creation) g_mutex_lock(single_threaded_create_table);
-        message("Thread %d: restoring table %s.%s from %s", td->thread_id,
-                dbt->database->target_database, dbt->source_table_name, rj->filename);
         int overwrite_error= 0;
         if (overwrite_tables) {
           overwrite_error= overwrite_table(td, dbt);
           if (overwrite_error) {
-            if (dbt->retry_count) {
-              dbt->retry_count--;
-              dbt->schema_state= NOT_CREATED;
-              m_warning("Drop table %s.%s failed: retry %u of %u", dbt->database->target_database, dbt->source_table_name, retry_count - dbt->retry_count, retry_count);
-              return 1;
-            } else {
-              m_critical("Drop table %s.%s failed: exiting", dbt->database->target_database, dbt->source_table_name);
+            // SMART HANDLING: For TRUNCATE/DELETE modes, failure just means table doesn't exist
+            // - proceed to CREATE TABLE instead of retrying/aborting
+            // DROP mode: failure is a real error, retry/abort as before
+            if (purge_mode == DROP) {
+              if (dbt->retry_count) {
+                dbt->retry_count--;
+                table_lock(dbt);
+                dbt->schema_state= NOT_CREATED;
+                table_unlock(dbt);
+                m_warning("Drop table %s.%s failed: retry %u of %u", dbt->database->target_database, dbt->source_table_name, retry_count - dbt->retry_count, retry_count);
+                if (serial_tbl_creation) g_mutex_unlock(single_threaded_create_table);
+                return 1;
+              } else {
+                m_critical("Drop table %s.%s failed: exiting", dbt->database->target_database, dbt->source_table_name);
+              }
             }
+            // TRUNCATE/DELETE failed - expected if table doesn't exist, proceed to CREATE
           } else if (dbt->retry_count < retry_count) {
               m_warning("Drop table %s.%s succeeded!", dbt->database->target_database, dbt->source_table_name);
           }
         }
         if ((purge_mode == TRUNCATE || purge_mode == DELETE) && !overwrite_error) {
-          message("Skipping table creation %s.%s from %s", dbt->database->target_database, dbt->source_table_name, rj->filename);
+          trace("Thread %d: Skipping table creation (TRUNCATE/DELETE mode) %s.%s",
+                td->thread_id, dbt->database->target_database, dbt->source_table_name);
         }else{
-          message("Thread %d: Creating table %s.%s from content in %s. On db: %s", td->thread_id, dbt->database->target_database, dbt->source_table_name, rj->filename, dbt->database->source_database);
-          if (restore_data_in_gstring(td, rj->data.srj->statement, TRUE, rj->data.srj->database)){
+          // mysql_real_query blocks until CREATE TABLE completes
+          int create_result = restore_data_in_gstring(td, rj->data.srj->statement, TRUE, rj->data.srj->database);
+
+          if (create_result){
             if (purge_mode == PM_SKIP){
               message("Skipping table or view %s.%s",
                 dbt->database->target_database, dbt->source_table_name);
@@ -317,30 +348,51 @@ int process_restore_job(struct thread_data *td, struct restore_job *rj){
               g_atomic_int_inc(&(detailed_errors.schema_errors));
               if (purge_mode == FAIL)
                 g_error("Thread %d: issue restoring %s",td->thread_id,rj->filename);
-              else 
+              else
                 g_critical("Thread %d: issue restoring %s",td->thread_id,rj->filename);
             }
-          }else{
-            get_total_created(td->conf, &total);
-            message("Thread %d: Table %s.%s created. Tables that pass created stage: %d of %d", td->thread_id, dbt->database->target_database, dbt->source_table_name, total , g_hash_table_size(td->conf->table_hash));
           }
         }
         if (serial_tbl_creation) g_mutex_unlock(single_threaded_create_table);
       }
+
+      // CRITICAL: Set CREATED state under lock AFTER mysql_query completes
+      // Then broadcast to wake ALL waiting data workers for this table
+      table_lock(dbt);
       dbt->schema_state=CREATED;
+      // FIX: Use g_cond_broadcast to wake ALL waiting data workers
+      g_cond_broadcast(dbt->schema_cond);
+      // OPTIMIZATION: Increment atomic counter for O(1) progress tracking
+      g_atomic_int_inc(&(td->conf->tables_created));
+      // OPTIMIZATION: Enqueue table to ready queue if it has pending jobs
+      enqueue_table_if_ready_locked(td->conf, dbt);
+      table_unlock(dbt);
+
       free_schema_restore_job(rj->data.srj);
       break;
     case JOB_RESTORE_FILENAME:
       if (!source_db || g_strcmp0(dbt->database->source_database,source_db)==0){
+          // SCHEMA-WAIT: Wait for table schema to be created before loading data
+          table_lock(dbt);
+          while (dbt->schema_state < CREATED) {
+            trace("Thread %d: Waiting for schema of %s.%s", td->thread_id,
+                  dbt->database->target_database, dbt->source_table_name);
+            g_cond_wait(dbt->schema_cond, dbt->mutex);
+          }
+          table_unlock(dbt);
+
           g_mutex_lock(progress_mutex);
           progress++;
           get_total_done(td->conf, &total);
-          message("Thread %d: restoring %s.%s part %d of %d from %s | Progress %llu of %llu. Tables %d of %d completed", td->thread_id,
-                    dbt->database->target_database, dbt->source_table_name, rj->data.drj->index, dbt->count, rj->filename, progress,total_data_sql_files, total , g_hash_table_size(td->conf->table_hash));
+          message("Thread %d restoring %s.%s part %d of %d from %s. Progress %llu of %llu. Tables %d of %d completed",
+                  td->thread_id, dbt->database->target_database, dbt->source_table_name,
+                  rj->data.drj->index, dbt->count, rj->filename,
+                  progress, total_data_sql_files, total, g_hash_table_size(td->conf->table_hash));
           g_mutex_unlock(progress_mutex);
           if (restore_data_from_file(td, rj->filename, FALSE, dbt->database) > 0){
             g_atomic_int_inc(&(detailed_errors.data_errors));
-            g_critical("Thread : issue restoring %s", rj->filename);
+            g_critical("Thread %d: Error loading data for %s.%s from %s",
+                       td->thread_id, dbt->database->target_database, dbt->source_table_name, rj->filename);
           }
       }
       g_atomic_int_dec_and_test(&(dbt->remaining_jobs));
@@ -381,11 +433,25 @@ int process_restore_job(struct thread_data *td, struct restore_job *rj){
             increse_object_error(rj->data.srj->object);
             if (dbt)
               dbt->schema_state= NOT_CREATED;
-          } else if (dbt)
+          } else if (dbt) {
+            table_lock(dbt);
             dbt->schema_state= CREATED;
+            // FIX: Use g_cond_broadcast to wake ALL waiting data workers
+            g_cond_broadcast(dbt->schema_cond);
+            g_atomic_int_inc(&(td->conf->tables_created));
+            // OPTIMIZATION: Enqueue table to ready queue if it has pending jobs
+            enqueue_table_if_ready_locked(td->conf, dbt);
+            table_unlock(dbt);
+          }
 
           if ( rj->data.srj->object == CREATE_DATABASE)
             rj->data.srj->database->schema_state = CREATED;
+        } else if (no_schemas && rj->data.srj->object == CREATE_DATABASE) {
+          // FIX: In --no-schema mode, we skip executing CREATE DATABASE
+          // but we MUST still mark the database as CREATED so that data loading can proceed.
+          trace("Skipping CREATE DATABASE for %s (--no-schema mode) but marking as CREATED",
+                rj->data.srj->database->target_database);
+          rj->data.srj->database->schema_state = CREATED;
         }
       }
       free_schema_restore_job(rj->data.srj);

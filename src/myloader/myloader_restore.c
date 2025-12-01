@@ -99,7 +99,10 @@ void initialize_connection_pool(){
     iors=new_io_restore_result();
     g_async_queue_push(restore_queues, iors);
   }
-  for (n = 0; n < 8*num_threads; n++) {
+  // OPTIMIZATION: Pre-allocate more statement buffers to reduce allocation during restore
+  // Each thread can have multiple statements in flight, especially with INSERT batching
+  guint statement_pool_size = 16 * num_threads;
+  for (n = 0; n < statement_pool_size; n++) {
     g_async_queue_push(free_results_queue, new_statement());
   }
 }
@@ -131,21 +134,75 @@ void reconnect_connection_data(struct connection_data *cd){
   execute_gstring(cd->thrconn, set_session);
 }
 
+// ER_NO_SUCH_TABLE = 1146 - Table doesn't exist
+#define ER_NO_SUCH_TABLE 1146
+// Maximum retries for race condition recovery
+// Increased to 10 to handle cross-connection DDL visibility delays in MySQL 8.4/RDS
+#define MAX_RACE_CONDITION_RETRIES 10
+// Sleep time between retries in microseconds (500ms base)
+// With exponential backoff: 500ms, 1s, 2s, 4s, 8s... (capped at 5s per retry)
+// Total potential wait: ~35-40 seconds, which handles even slow DDL propagation
+#define RACE_CONDITION_RETRY_SLEEP 500000
+// Maximum sleep per retry to avoid excessively long waits
+#define MAX_RETRY_SLEEP 5000000
+
 int restore_data_in_gstring_by_statement(struct connection_data *cd, GString *data, gboolean is_schema, guint *query_counter)
 {
   guint en=mysql_real_query(cd->thrconn, data->str, data->len);
   if (en) {
+    guint error_code = mysql_errno(cd->thrconn);
+
     if (is_schema)
-      g_warning("Thread %ld using connection %ld - ERROR %d: %s\n%s", cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn), data->str);
+      g_warning("[RESTORE] Thread %ld conn %ld - ERROR %d: %s\n%s", cd->thread_id, cd->connection_id, error_code, mysql_error(cd->thrconn), data->str);
     else{
-      g_warning("Thread %ld using connection %ld - ERROR %d: %s"    , cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn));
+      g_warning("[RESTORE] Thread %ld conn %ld - ERROR %d: %s", cd->thread_id, cd->connection_id, error_code, mysql_error(cd->thrconn));
     }
 
-    if ( mysql_errno(cd->thrconn) != 0 && !g_list_find(ignore_errors_list, GINT_TO_POINTER(mysql_errno(cd->thrconn) ))){
+    // Special handling for "Table doesn't exist" error - likely a cross-connection DDL visibility issue
+    if (error_code == ER_NO_SUCH_TABLE && !is_schema) {
+      // Retry with exponential backoff (capped at MAX_RETRY_SLEEP)
+      // On every 3rd retry, reconnect to force metadata cache refresh
+      guint retry;
+      for (retry = 0; retry < MAX_RACE_CONDITION_RETRIES; retry++) {
+        guint sleep_time = RACE_CONDITION_RETRY_SLEEP * (1 << retry); // Exponential backoff
+        if (sleep_time > MAX_RETRY_SLEEP) sleep_time = MAX_RETRY_SLEEP; // Cap at 5 seconds
+
+        // Every 3rd retry (retry 2, 5, 8...), reconnect to force metadata refresh
+        if (retry > 0 && retry % 3 == 2) {
+          trace("Thread %ld conn %ld: DDL visibility retry %u/%d - reconnecting",
+                cd->thread_id, cd->connection_id, retry + 1, MAX_RACE_CONDITION_RETRIES);
+          reconnect_connection_data(cd);
+        }
+
+        g_usleep(sleep_time);
+
+        g_atomic_int_inc(&(detailed_errors.retries));
+        if (!mysql_real_query(cd->thrconn, data->str, data->len)) {
+          message("Thread %ld conn %ld: Retry %u succeeded - table now visible",
+                  cd->thread_id, cd->connection_id, retry + 1);
+          *query_counter = *query_counter + 1;
+          g_string_set_size(data, 0);
+          return 0;
+        }
+
+        error_code = mysql_errno(cd->thrconn);
+        if (error_code != ER_NO_SUCH_TABLE) {
+          break;
+        }
+      }
+
+      g_critical("Thread %ld conn %ld: All %d retries failed for 'Table doesn't exist'",
+                 cd->thread_id, cd->connection_id, MAX_RACE_CONDITION_RETRIES);
+      errors++;
+      return 1;
+    }
+
+    // OPTIMIZATION: Use O(1) hash lookup instead of O(n) list scan
+    if ( error_code != 0 && !should_ignore_error_code(error_code)){
       if (mysql_ping(cd->thrconn)) {
         reconnect_connection_data(cd);
         if (!is_schema && commit_count > 1) {
-          g_critical("Thread %ld using connection %ld - ERROR %d: Lost connection error. %s", cd->thread_id, cd->connection_id,  mysql_errno(cd->thrconn), mysql_error(cd->thrconn));
+          g_critical("[RESTORE] Thread %ld conn %ld - ERROR %d: Lost connection. %s", cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn));
           errors++;
           return 2;
         }
@@ -154,9 +211,9 @@ int restore_data_in_gstring_by_statement(struct connection_data *cd, GString *da
       g_atomic_int_inc(&(detailed_errors.retries));
       if (mysql_real_query(cd->thrconn, data->str, data->len)) {
         if (is_schema)
-          g_critical("Thread %ld using connection %ld - ERROR %d: %s\n%s", cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn), data->str);
+          g_critical("[RESTORE] Thread %ld conn %ld - ERROR %d: %s\n%s", cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn), data->str);
         else{
-          g_critical("Thread %ld using connection %ld - ERROR %d: %s"    , cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn));
+          g_critical("[RESTORE] Thread %ld conn %ld - ERROR %d: %s", cd->thread_id, cd->connection_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn));
         }
         errors++;
         return 1;
@@ -200,7 +257,8 @@ struct connection_data *wait_for_available_restore_thread(struct thread_data *td
 
 extern gboolean control_job_ended;
 gboolean request_another_connection(struct thread_data *td, struct io_restore_result *io_restore_result, gboolean start_transaction, struct database *use_database, GString *header){
-  if ( control_job_ended && td->granted_connections < td->dbt->max_threads && g_list_length(td->dbt->restore_job_list)==0 ){
+  // OPTIMIZATION: Use cached job_count instead of O(n) g_list_length()
+  if ( control_job_ended && td->granted_connections < td->dbt->max_threads && td->dbt->job_count == 0 ){
     g_assert(header);
     struct connection_data *cd=g_async_queue_try_pop(connection_pool);
     if(cd){
@@ -224,7 +282,7 @@ int m_commit_and_start_transaction(struct connection_data *cd, guint* query_coun
   return 0;
 }
 
-int restore_insert(struct connection_data *cd, struct thread_data*td, 
+int restore_insert(struct connection_data *cd, struct thread_data*td,
                   GString *data, guint *query_counter, guint offset_line, struct db_table *dbt)
 {
   char *next_line=g_strstr_len(data->str,-1,"VALUES") + 6;
@@ -232,24 +290,33 @@ int restore_insert(struct connection_data *cd, struct thread_data*td,
   int r=0;
   guint tr=0,current_offset_line=offset_line-1;
   gchar *current_line=next_line;
-  next_line=g_strstr_len(current_line, -1, "\n");
-  GString * new_insert=g_string_sized_new(strlen(insert_statement_prefix));
+  // OPTIMIZATION: Calculate buffer end once for memchr bounds checking
+  gchar *buffer_end = data->str + data->len;
+  // OPTIMIZATION: Use memchr instead of g_strstr_len - O(n) vs O(nm) for single char search
+  // memchr is highly optimized (SIMD on modern CPUs) vs g_strstr_len's generic substring search
+  next_line = memchr(current_line, '\n', buffer_end - current_line);
+  // OPTIMIZATION: Pre-allocate larger buffer to reduce reallocations
+  // prefix + typical INSERT statement ~64KB
+  guint prefix_len = strlen(insert_statement_prefix);
+  GString * new_insert=g_string_sized_new(prefix_len + 65536);
   guint current_rows=0;
   guint64 transaction_size=0;
   do {
     current_rows=0;
     g_string_set_size(new_insert, 0);
-    g_string_printf(new_insert,"/* Completed: %"G_GUINT64_FORMAT"%% */ ", dbt->rows>0?dbt->rows_inserted*100/dbt->rows:0);
-    new_insert=g_string_append(new_insert,insert_statement_prefix);
+    // OPTIMIZATION: Use append_printf to avoid intermediate allocation
+    g_string_append_printf(new_insert,"/* Completed: %"G_GUINT64_FORMAT"%% */ ", dbt->rows>0?dbt->rows_inserted*100/dbt->rows:0);
+    g_string_append_len(new_insert, insert_statement_prefix, prefix_len);
     guint line_len=0;
     do {
-      char *line=g_strndup(current_line, next_line - current_line);
-      line_len=strlen(line);
-      g_string_append(new_insert, line);
-      g_free(line);
+      // OPTIMIZATION: Direct append with length instead of g_strndup + strlen + append + g_free
+      line_len = next_line - current_line;
+      g_string_append_len(new_insert, current_line, line_len);
       current_rows++;
       current_line=next_line+1;
-      next_line=g_strstr_len(current_line, -1, "\n");
+      // OPTIMIZATION: Use memchr for O(1) single-char search instead of g_strstr_len
+      // For large INSERT statements (100K+ rows), this eliminates O(n²) scanning behavior
+      next_line = memchr(current_line, '\n', buffer_end - current_line);
       current_offset_line++;
     } while ((rows == 0 || current_rows < rows) && next_line != NULL);
     if (current_rows > 1 || (current_rows==1 && line_len>0) ){
@@ -349,22 +416,29 @@ void *restore_thread(MYSQL *thrconn){
 
 
 
+// FIX: This function had TWO bugs causing deadlock:
+// 1. Double-lock: locked mutex inside, then caller locked again
+// 2. Wrong pointer cast: orig_key instead of &orig_key
+// Now returns TRUE if caller should proceed (mutex locked), FALSE if should skip
 gboolean load_data_mutex_locate( gchar * filename , GMutex ** mutex){
   g_mutex_lock(load_data_list_mutex);
   gchar * orig_key=NULL;
-  if (!g_hash_table_lookup_extended(load_data_list,filename, (gpointer*) orig_key, (gpointer*) *mutex)){
+  // FIX: Use &orig_key and mutex (not *mutex) for proper pointer-to-pointer semantics
+  if (!g_hash_table_lookup_extended(load_data_list, filename, (gpointer*) &orig_key, (gpointer*) mutex)){
+    // First time seeing this file - create new mutex, lock it, add to hash
     *mutex=g_mutex_new();
-    g_mutex_lock(*mutex);
+    // FIX: Don't lock here - let the CALLER lock to avoid double-lock deadlock
     g_hash_table_insert(load_data_list, g_strdup(filename), *mutex);
     g_mutex_unlock(load_data_list_mutex);
-    return TRUE;
+    return TRUE;  // Caller should lock and proceed
   }
+  // File already in hash - remove it (we're done with this file)
   if (orig_key!=NULL){
     g_hash_table_remove(load_data_list, orig_key);
 //    g_mutex_free(*mutex);
   }
   g_mutex_unlock(load_data_list_mutex);
-  return FALSE;
+  return FALSE;  // Caller should NOT lock (file already processed)
 }
 
 void release_load_data_as_it_is_close( gchar * filename ){
@@ -396,7 +470,9 @@ struct statement * new_statement(){
   struct statement *stmt= g_new0(struct statement, 1);
   initialize_statement(stmt);
   stmt->filename=NULL;
-  stmt->buffer=g_string_new_len("",30);
+  // OPTIMIZATION: Larger initial buffer for statements
+  // INSERT statements can be very large, reducing reallocation
+  stmt->buffer=g_string_sized_new(16384);
   return stmt;
 }
 
@@ -517,7 +593,9 @@ int restore_data_from_mydumper_file(struct thread_data *td, const char *filename
 
   FILE *infile=NULL;
   gboolean eof = FALSE;
-  GString *data = g_string_sized_new(256);
+  // OPTIMIZATION: Larger initial buffer size for data files (many are multi-MB)
+  // This reduces reallocation overhead during file reading
+  GString *data = g_string_sized_new(is_schema ? 4096 : 65536);
   guint line=0,preline=0;
   gchar *path = g_build_filename(directory, filename, NULL);
   infile=myl_open(path,"r");
